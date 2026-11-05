@@ -1,0 +1,72 @@
+name: Proofs
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+# Three legs, one bar. Every leg is the same run-action (installs a released prova, runs the
+# profile the manifest declares), so local and CI can't drift: `prova run quality` here IS
+# `prova run quality` on your machine.
+#
+# FIRST-RUN NOTE: the quality and coverage ratchets refuse to pass without a committed baseline, so
+# the quality leg is red until you run the ritual once and commit what it writes —
+#
+#   prova run quality --update-baseline
+#   prova run coverage --update-baseline
+#
+# Pin a specific prova with `with: { version: v0.19.0 }`; omit it to take the action's default.
+jobs:
+  proofs:
+    name: Prova
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+
+      # The black-box suite + the fast gates, under the ci profile — whose `must_run = ["cargo"]`
+      # turns a runner that lost its toolchain into a loud failure instead of a wall of skips.
+      - name: Run the proof suite
+        uses: prova-rs/run-action@v1
+        with:
+          profile: ci
+
+  quality:
+    name: Quality gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+
+      # jscpd powers the duplication ratchet. It is a `requires` world fact, not a `must_run`, so
+      # without this step that one gate would SKIP (visibly) while the rest still run.
+      - name: Install jscpd
+        run: npm install -g jscpd
+
+      # clippy -D warnings, the unwrap/expect census, duplication, file sizes — the ratchets held
+      # to .prova/baselines/quality.json. (GitHub's Linux runners ship the clippy component.)
+      - name: Quality gates
+        uses: prova-rs/run-action@v1
+        with:
+          profile: quality
+
+  ut:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+
+      # The ut leg's deputy. The profile `must_run`s it, so a runner without it FAILS loudly
+      # rather than skipping the leg.
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      # Conducts nextest once (fail-fast off in .prova/nextest.toml, handed to nextest as tool
+      # config so one conduct reports EVERY failing case), and adopts all cases into the account.
+      - name: Unit tests (prova run ut)
+        uses: prova-rs/run-action@v1
+        with:
+          profile: ut
+

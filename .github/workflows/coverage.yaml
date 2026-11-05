@@ -1,0 +1,31 @@
+name: Coverage
+
+# The judicious cadence: the instrumented conduct is the suite's most expensive leg, and the
+# ratchet floor does not need per-commit sampling — one nightly conduct holds it, and a red morning
+# bisects one day's commits. Manual dispatch covers "I want the number now".
+#
+# Red until the baseline exists: run `prova run coverage --update-baseline` once and commit
+# .prova/baselines/quality.json.
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+jobs:
+  coverage:
+    name: Line coverage (ratcheted)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-nextest and cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest,cargo-llvm-cov
+
+      - name: Coverage (prova run coverage)
+        uses: prova-rs/run-action@v1
+        with:
+          profile: coverage
+

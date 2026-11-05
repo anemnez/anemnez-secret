@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "metrics": {
+    "run.duration_ms": {
+      "value": 6449.0,
+      "direction": "lower_is_better"
+    },
+    "run.lock_wait_ms": {
+      "value": 0.0,
+      "direction": "lower_is_better"
+    }
+  }
+}

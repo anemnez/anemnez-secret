@@ -1,0 +1,9 @@
+-- The runtime companion: loaded once, pre-suite; `runtime.*` is only valid here. Register
+-- capabilities — world facts a test can `requires` — as the suite grows, e.g.:
+--
+--   runtime.capability("staging", function() return os.getenv("STAGING_URL") ~= nil end)
+--
+-- Tool presence (cargo, cargo-nextest, jscpd) needs no registration: naming a binary in `requires`
+-- checks PATH directly. And opt-in test CLASSES are not capabilities — declare `switch = "<class>"`
+-- on the proof (fail-closed at the declaration site) and throw it with `-s <class>` or a profile's
+-- `switches`, the way the quality/ut/coverage legs here already do.

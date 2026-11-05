@@ -1,0 +1,20 @@
+[package]
+name = "anemnez-secret"
+description = "How a product on the Anemnez Stack holds its own key material: a value that never prints, keychain custody by code signature, and the owner check"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Custody calls the Security framework directly, so a value never passes through a command line.
+security-framework = "3"
+# The owner check: LAContext deviceOwnerAuthentication (Touch ID or the login password).
+block2 = "0.6"
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-local-authentication = "0.3"
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,25 @@
+{
+  "schema": 1,
+  "metrics": {
+    "rust.duplication.clones": {
+      "value": 0.0,
+      "direction": "lower_is_better"
+    },
+    "rust.expect.production": {
+      "value": 0.0,
+      "direction": "lower_is_better"
+    },
+    "rust.files.oversized": {
+      "value": 0.0,
+      "direction": "lower_is_better"
+    },
+    "rust.functions.too_long": {
+      "value": 0.0,
+      "direction": "lower_is_better"
+    },
+    "rust.unwrap.production": {
+      "value": 0.0,
+      "direction": "lower_is_better"
+    }
+  }
+}

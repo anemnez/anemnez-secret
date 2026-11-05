@@ -1,0 +1,88 @@
+# The project's quality surface, driven through prova (retrofitted by `prova init rust-project`).
+# Run `prova` from the project root.
+#
+# This manifest lives in the `.prova/` nook, so prova's own files tuck away while your proofs stay
+# visible at the project root (the nook's parent — discovery walks up to it). Every path below
+# resolves against that root.
+#
+# The bar, at a glance (`prova run --list` says the same thing):
+#
+#   prova                 build smoke + the project's black-box proofs — the inner loop
+#   prova run quality     clippy -D warnings, unwrap/expect census, duplication, file sizes
+#   prova run ut          unit tests, conducted once via cargo nextest and adopted into the account
+#   prova run coverage    line coverage, ratcheted against the committed baseline
+#   prova run all         the pre-push sweep: proofs + ut + quality, one exit code
+#
+# FIRST-RUN RITUAL (once, then commit the baselines with the code): the ratchets refuse to pass
+# without a committed floor, so establish them before the first push —
+#
+#   prova run quality --update-baseline
+#   prova run coverage --update-baseline
+#
+# The establishing pass itself reports red (a metric with no floor passes nothing — that is the
+# refusal to green-wash) while it writes the floors; the run after it is the green ratchet.
+[run]
+proofs   = ["proofs"]           # directory-name patterns; your proof suites live in the open
+config   = ".prova/config.lua"  # the runtime companion — where capabilities are registered
+packages = ".prova/packages"    # this project's own packages; `require("<dir>")` reaches each one
+
+# The cargo-based quality gates (clippy, the unwrap/expect census, duplication, file sizes under
+# proofs/quality/) recompile or rescan the workspace, so they never run because a person typed
+# `prova` — they sit behind the `quality` switch. This profile scopes to the proofs/quality/ dir
+# (positive selection: nothing else can creep in) and throws the switch. Ad hoc: `prova -s quality`.
+[profiles.quality]
+description = "code-quality gates: clippy -D warnings, the unwrap/expect ratchet, duplication, file sizes (recompiles the workspace)"
+proofs      = ["quality"]
+switches    = ["quality"]
+
+# The deputed unit-test leg: `prova run ut` conducts `cargo nextest` ONCE (a file-scoped fixture
+# compiles + runs the workspace's unit tests, emitting junit), adopts every case into the account,
+# and case-granular readers bind claims to named unit tests — conduct once, read many. `must_run`
+# keeps the WORLD fact: under this profile a missing nextest FAILS rather than skips — `prova run
+# ut` is a contract, not a courtesy.
+[profiles.ut]
+description = "the workspace's unit tests, conducted once via cargo nextest and adopted into the account (deputed junit)"
+proofs      = ["ut"]
+switches    = ["ut"]
+must_run    = ["cargo-nextest"]
+
+# Code coverage, ratcheted: conducts `cargo llvm-cov nextest` (an instrumented rebuild + run of the
+# workspace's unit tests) and holds the line-coverage total to the committed baseline in
+# .prova/baselines/quality.json — regressions are red, and a new floor is raised deliberately via
+# `prova run coverage --update-baseline`. Not part of `all`: the instrumented rebuild roughly
+# doubles the sweep; CI gives coverage its own leg.
+[profiles.coverage]
+description = "line coverage, ratcheted: cargo llvm-cov nextest against the committed baseline"
+proofs      = ["coverage"]
+switches    = ["coverage"]
+must_run    = ["cargo-llvm-cov", "cargo-nextest"]
+
+# Everything short of the slow stuff, one command: the whole black-box suite PLUS the switched
+# heavy legs — unit tests deputed via nextest, the cargo quality gates. The pre-push answer to
+# "did I break anything?": slower than bare `prova`, far faster than waiting for CI, and one exit
+# code for all of it.
+[profiles.all]
+description = "the pre-push sweep: every black-box proof plus the ut and quality legs"
+switches    = ["ut", "quality"]
+must_run    = ["cargo-nextest"]
+
+# The CI profile for the black-box leg. It exists mainly for `must_run`, which is the inverse of a
+# test's `requires`:
+#
+#   requires  — a fact about a TEST ("I need cargo"). Absent → the test SKIPS, with a reason.
+#               Right on a laptop, where a missing tool should not fail your morning.
+#   must_run  — a promise about an ENVIRONMENT ("here, cargo is provided"). Absent → the whole
+#               run FAILS, before anything executes.
+#
+# Without it, a CI box that lost its toolchain skips every cargo-backed proof and still exits 0 —
+# "we answered everything" reading identically to "we could not ask anything".
+[profiles.ci]
+must_run = ["cargo"]
+
+# Declare the prova this suite needs, and an older binary says so up front instead of failing
+# mid-run on a feature it does not have. Write `>=`: the value is a semver RANGE, so a bare
+# The floor is the first prova carrying the locks grammar (`locks = { prova.writes("cargo") }`,
+# held as a flock across every prova instance — prova learn locks): on an older binary the
+# rendered house rules would be silently ignored, which is worse than a clear refusal.
+[requires]
+prova = ">= 0.20.2"

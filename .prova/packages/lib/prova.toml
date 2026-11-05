@@ -1,0 +1,9 @@
+[package]
+name = "lib"
+description = "The project's shared library: fixtures, topologies, and helpers reused across proof suites."
+
+# Private dependencies — other packages this library requires, resolved for this package alone (a
+# consumer of `lib` never sees them). For example:
+#   [dependencies]
+#   redis = "prova-rs/prova-redis@v1"
+[dependencies]

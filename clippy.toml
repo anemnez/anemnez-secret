@@ -1,0 +1,7 @@
+# Function-size gate: clippy::too_many_lines fires past this (proofs/quality — the census
+# ratchets the count, so oversized functions are standing debt, never silent growth).
+#
+# Rendering preserves an existing clippy.toml, and that is safe here: clippy's own default for
+# too-many-lines-threshold is also 100, so the census works identically whether this file landed
+# or the project's own config won.
+too-many-lines-threshold = 100

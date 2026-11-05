@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+repository = "https://github.com/anemnez/anemnez-secret"
+license = "MIT OR Apache-2.0"
+version = "0.1.0"
+# Released to Artichoke only for now, like anemnez-extension; crates.io comes when third-party
+# extensibility is advertised (fabric CONVERGENCE.md §0 (7)).
+publish = ["artichoke"]

@@ -1,0 +1,17 @@
+/target
+.DS_Store
+# The LuaLS editor pointer. prova regenerates it and it holds machine-local absolute paths, so it is
+# per-machine rather than shared. Everything else under .prova/ — the manifest, config.lua, packages/,
+# baselines/ — IS tracked: that is your project's source, and the baselines are the quality floors.
+/.luarc.json
+# LLVM coverage droppings: an instrumented binary whose environment lacks LLVM_PROFILE_FILE (a
+# hand-run of the coverage build, a scrubbed-env child) writes default_<sig>_0_<pid>.profraw into
+# its OWN cwd — LLVM's default, not anything the coverage leg chooses. Learned in production: 36
+# of these once reached a repo root and its snapshots before the rule existed.
+*.profraw
+# Snapshot rejects: a red `matches_snapshot` writes the candidate beside the golden file for
+# review; accept it by renaming over the `.snap`, never by committing the `.new`.
+*.snap.new
+# Nothing here for prova's generated state, deliberately. The --last-failed record and held-topology
+# run-state live in .prova/var/, which ships its own `.gitignore` of `*` — every package ignores its
+# own state, at any depth, so this file never needs an entry for it.

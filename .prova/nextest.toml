@@ -1,0 +1,18 @@
+# The nextest profile the `prova run ut` gate conducts (proofs/ut/nextest.prova.lua): its junit
+# artifact (target/nextest/prova/junit.xml) is what `junit.verify` adopts into the account, per
+# the conduct-once-read-many pattern.
+#
+# It lives HERE — in the .prova/ nook, not .config/nextest.toml — and reaches nextest via
+# `--tool-config-file prova:<this file>`, nextest's mechanism for exactly this composition: the
+# project's own .config/nextest.toml (if any) keeps working untouched and takes precedence, so a
+# retrofit never collides with it and never depends on editing it. If the project defines its own
+# `[profile.prova]`, that wins — deliberately.
+#
+# fail-fast is OFF so one conduct adopts the COMPLETE picture: each conduct costs a workspace
+# compilation, so an agent burning down red cases must see every failure per run, not the first
+# one followed by cancelled (and therefore unattested) cases.
+[profile.prova]
+fail-fast = false
+
+[profile.prova.junit]
+path = "junit.xml"
