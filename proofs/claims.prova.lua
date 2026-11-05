@@ -4,7 +4,6 @@
 local SPEC = "docs/specs/SECRET.md#"
 
 for _, owed in ipairs({
-	{ "a-caller-is-known-by-its-code-signature", "identity moves here from fabric's step 0 writers.rs (J)" },
 	{ "the-owner-is-proven-never-assumed", "the real check is one #[ignore] by-hand test; its users' tests (Ladon's policy) bind it" },
 }) do
 	prova.test("claim " .. owed[1] .. " — owed", {

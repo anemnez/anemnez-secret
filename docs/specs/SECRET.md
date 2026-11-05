@@ -43,7 +43,20 @@ hardened runtime and none of `get-task-allow`, `disable-library-validation` or
 `allow-dyld-environment-variables`, and only then the signing identifier and team, checked against a
 trust table. The built-in entry ("team P9DJA3JCKP, `ai.anemnez.<p>d` owns `<p>`") is the table's
 default data, overridable only by a person. Nothing else in any product writes these checks (J,
-moving fabric's step 0 `writers.rs` here).
+moved from fabric's step 0 `writers.rs`).
+- `identity::of_peer(socket)` gives a peer's [`Identity`] `{team, identifier}`, or why it has none. The
+  requirement is `anchor apple generic` (any team; which teams count is the table's), validated before
+  anything is read from the signature. A platform binary names no team, so it is no identity.
+- `TrustTable` holds the rows: `Anemnez {team}`, under which `ai.anemnez.<p>` writes what product `<p>`
+  owns (who owns what is the caller's to say), and `Scoped {team, identifier, segment}`, which a person
+  adds for one other team's process and exactly one segment. `TrustTable::anemnez(team)` is the default
+  data, and an empty table admits nobody. `admits(identity, segment, owner)` is the one decision.
+- `identity::own()` is this process's identity by the same check (`SecCodeCopySelf`). A product builds its
+  default table from it (`TrustTable::anemnez(&own()?.team)`, "my own team"), never from a config file
+  another process could edit. Config may narrow a table, never widen it; widening is a person's act,
+  through the owner check.
+- A verdict vouches for the process that connected, at connect, not for whoever later holds the socket,
+  so a product never passes its connection on.
 
 ## 4. The owner is proven, never assumed
 

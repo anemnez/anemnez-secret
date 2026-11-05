@@ -4,11 +4,12 @@
 //! - [`secret`]: [`Secret`], a value that never prints and is zeroed on drop.
 //! - [`custody`]: keychain items written by the owning binary, read back by it (macOS).
 //! - [`owner`]: the owner check, Touch ID or the login password, behind a trait (macOS).
-//! - `identity`: a caller's code identity from its audit token, checked against a trust table
-//!   (J, next; the one place a code signature is judged).
+//! - [`identity`]: a caller's code identity from its audit token, and the trust table that says what it
+//!   may do (the one place a code signature is judged).
 
 #[cfg(target_os = "macos")]
 pub mod custody;
+pub mod identity;
 pub mod owner;
 pub mod secret;
 
