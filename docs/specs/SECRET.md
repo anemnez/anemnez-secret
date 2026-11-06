@@ -28,6 +28,11 @@ is named by a service and an account the product chooses (a per-instance account
 `signer@<node id>`). A value never passes a command line: the Security framework is called directly.
 - **Locked is not logged out.** A keychain that is locked or refuses without a dialog answers
   `Unavailable`, never `NotHeld`, so no caller makes a new key over an old one.
+- **Never a dialog.** A `Keychain` is non-interactive by default: making one turns keychain dialogs off
+  for the process, never to be turned on again, so an item whose access list doesn't admit the caller
+  (another build's, the normal case after a signing change) answers `Unavailable` at once, never a
+  prompt on the person's screen with a daemon blocked on it. `login_interactive` is the explicit
+  opt-in, for a command a person runs at the Mac, never a daemon (F and D, 2026-11-06).
 - **`held` never reads the value**, only the item's attributes.
 - **Tests never see a person's keychain**: they use a keychain file of their own.
 - **The maker is on the item.** `add` never overwrites, and writes `made by: <designated requirement>`

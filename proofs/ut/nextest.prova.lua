@@ -90,6 +90,7 @@ spoken_for("a-caller-is-known-by-its-code-signature", {
 spoken_for("a-held-key-is-read-only-by-its-owning-build", {
 	"custody::tests::an_item_holds_what_was_put_under_it",
 	"custody::tests::errors_never_say_the_value_and_locked_is_not_not_held",
+	"custody::tests::another_builds_item_reads_unavailable_without_a_dialog",
 })
 spoken_for("a-hand-off-never-leaves-a-key-unheld", {
 	"handoff::tests::a_hand_off_moves_the_value_and_finishes_after_a_cut",
