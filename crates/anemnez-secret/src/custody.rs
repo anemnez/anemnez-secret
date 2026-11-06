@@ -22,10 +22,25 @@ use crate::Secret;
 mod quiet {
     use security_framework_sys::keychain::SecKeychainSetUserInteractionAllowed;
 
-    /// Turn keychain dialogs off (`false`) or on (`true`) for this process.
-    pub(super) fn set(allowed: bool) {
+    /// Set once a non-interactive Keychain is made: from then on this process never turns dialogs on.
+    static QUIET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// Turn keychain dialogs off for this process, for good.
+    pub(super) fn off() {
+        QUIET.store(true, std::sync::atomic::Ordering::SeqCst);
         // SAFETY: a plain call; it sets whether this process may show keychain dialogs.
-        unsafe { SecKeychainSetUserInteractionAllowed(u8::from(allowed)) };
+        unsafe { SecKeychainSetUserInteractionAllowed(0) };
+    }
+
+    /// Turn keychain dialogs on, unless this process has already made a non-interactive Keychain: a
+    /// process is one or the other, never both (D, 2026-11-06).
+    pub(super) fn on() -> Result<(), String> {
+        if QUIET.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("this process already holds a non-interactive keychain, so it never shows a keychain dialog; run the interactive command in a process of its own".into());
+        }
+        // SAFETY: as above.
+        unsafe { SecKeychainSetUserInteractionAllowed(1) };
+        Ok(())
     }
 
     /// Whether dialogs are allowed right now (tests).
@@ -125,15 +140,16 @@ impl Keychain {
     /// The user's default keychain, non-interactive: keychain dialogs are off for the process from here
     /// on. Never in a test: tests use [`Keychain::create_at`].
     pub fn login() -> Self {
-        quiet::set(false);
+        quiet::off();
         Self { keychain: None }
     }
 
     /// The user's default keychain WITH dialogs, for a command a person runs at the Mac (an explicit
-    /// adoption). Never in a daemon: it turns dialogs on for the whole process.
-    pub fn login_interactive() -> Self {
-        quiet::set(true);
-        Self { keychain: None }
+    /// adoption). Never in a daemon: it turns dialogs on for the whole process, so it is refused in a
+    /// process that has already made a non-interactive Keychain.
+    pub fn login_interactive() -> Result<Self, String> {
+        quiet::on()?;
+        Ok(Self { keychain: None })
     }
 
     /// A keychain file of its own at `path`, made with `password` (proofs: never the login keychain).
@@ -144,7 +160,7 @@ impl Keychain {
             .create(path)
             .map_err(|e| e.to_string())?;
         keychain.unlock(Some(password)).map_err(|e| e.to_string())?;
-        quiet::set(false);
+        quiet::off();
         Ok(Self {
             keychain: Some(keychain),
         })
@@ -155,7 +171,7 @@ impl Keychain {
     pub fn open_at(path: &std::path::Path, password: &str) -> Result<Self, String> {
         let mut keychain = SecKeychain::open(path).map_err(|e| e.to_string())?;
         keychain.unlock(Some(password)).map_err(|e| e.to_string())?;
-        quiet::set(false);
+        quiet::off();
         Ok(Self {
             keychain: Some(keychain),
         })
@@ -391,6 +407,18 @@ mod tests {
             );
         }
         assert!(!super::quiet::allowed(), "and dialogs stay off");
+    }
+
+    /// A process is one or the other (D, 2026-11-06): once a non-interactive Keychain exists, an
+    /// interactive one is refused, naming why, and dialogs stay off.
+    #[test]
+    fn an_interactive_keychain_is_refused_once_a_quiet_one_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let _quiet =
+            Keychain::create_at(&dir.path().join("proof.keychain-db"), "proof-only").unwrap();
+        let refused = Keychain::login_interactive().map(|_| ()).unwrap_err();
+        assert!(refused.contains("non-interactive"), "{refused}");
+        assert!(!super::quiet::allowed(), "dialogs stay off");
     }
 
     /// `SECRET.md#a-held-key-is-read-only-by-its-owning-build`: every error says what and why,
