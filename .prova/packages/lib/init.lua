@@ -55,12 +55,19 @@ lib.build = prova.fixture("cargo.build", Scope.File, function()
 end)
 
 --- Path to a named binary in the debug target dir — pair with `t:use(lib.build)`, e.g.
---- `shell.run({ lib.bin("my-server"), "--port", "0" })`. Honors a relocated target dir via
---- metadata when you have it; the plain form covers the common case.
+--- `shell.run({ lib.bin("my-server"), "--port", "0" })`. The target dir is where lib.build's cargo
+--- wrote: `$CARGO_TARGET_DIR` when set (CI and gate runners often relocate it), else `<root>/target`.
+--- Reading `<root>/target` while cargo built elsewhere drives a stale binary, or none at all.
 ---@param name string the binary's name (a [[bin]] target)
 ---@return string
 function lib.bin(name)
-	return prova.root .. "/target/debug/" .. name
+	local target = os.getenv("CARGO_TARGET_DIR")
+	if target == nil or target == "" then
+		target = prova.root .. "/target"
+	elseif target:sub(1, 1) ~= "/" then
+		target = prova.root .. "/" .. target
+	end
+	return target .. "/debug/" .. name
 end
 
 return lib
