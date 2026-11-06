@@ -81,6 +81,7 @@ end
 
 spoken_for("a-secret-never-prints", { "secret::tests::a_secret_printed_any_way_says_nothing" })
 spoken_for("a-caller-is-known-by-its-code-signature", {
+	"identity::tests::a_process_is_checked_once_and_only_lasting_verdicts_are_kept",
 	"identity::tests::only_a_hardened_untamperable_signature_is_an_identity",
 	"identity::tests::the_trust_table_admits_an_owner_and_a_scoped_entry_and_nothing_else",
 	"identity::tests::a_running_codes_signature_is_read_only_after_it_is_validated",
