@@ -47,7 +47,11 @@ so it gives a guesser nothing to test a value against, even a short secret.
 holder starts the successor binary as a child and listens on a socket in a fresh directory only it
 can enter, named to the child in `ANEMNEZ_RETRUST_SOCKET`; the child connects. That connection's
 audit token is the child's own, read at connect, so `identity` judges the code that answered. A
-socketpair would not do: both its ends carry the token of the process that made it, the holder. The
+socketpair would not do: both its ends carry the token of the process that made it, the holder.
+**Only the child it spawned is taken**: the connection's audit-token pid must be that child's (unreaped,
+so the pid cannot be reused). A connection from any other process, however it is signed, is refused and
+dropped while the holder keeps waiting, so an impostor can neither receive nor deny the hand-off; once
+the child is connected, the socket is unlinked (D and F, 2026-11-06). The
 successor must answer as the identifier the holder expects; one of the holder's OWN team is allowed as
 configured, and one of any other team only through the owner check, which names the change. Only then
 does the hand-off run over the connection. A product's binary that finds `ANEMNEZ_RETRUST_SOCKET` set

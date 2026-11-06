@@ -99,4 +99,5 @@ spoken_for("a-hand-off-never-leaves-a-key-unheld", {
 spoken_for("a-key-goes-only-to-a-checked-successor", {
 	"retrust::tests::a_successor_is_allowed_by_identifier_then_team_then_the_owner",
 	"retrust::tests::a_key_moves_to_a_checked_child_and_never_to_another",
+	"retrust::tests::only_the_spawned_childs_connection_is_taken",
 })

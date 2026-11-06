@@ -90,12 +90,9 @@ pub fn own() -> Result<Identity, String> {
     Err("this OS has no code signatures to read".to_owned())
 }
 
-/// The signature of the code behind a local socket's peer, if it meets `requirement`.
+/// A local socket's peer's audit token, as the kernel recorded it at connect: an `audit_token_t`.
 #[cfg(target_os = "macos")]
-pub fn signature_of_peer(
-    socket: std::os::fd::BorrowedFd<'_>,
-    requirement: &str,
-) -> Result<Signature, String> {
+fn audit_token(socket: std::os::fd::BorrowedFd<'_>) -> Result<Vec<u8>, String> {
     use std::os::fd::AsRawFd;
     // sys/un.h: SOL_LOCAL 0, LOCAL_PEERTOKEN 6, an audit_token_t of eight u32s.
     let mut token = [0u8; 32];
@@ -117,7 +114,27 @@ pub fn signature_of_peer(
         ));
     }
     let len = usize::try_from(len).map_err(|e| e.to_string())?;
-    macos::check(&macos::guest_by_audit(&token[..len])?, requirement)
+    Ok(token[..len].to_vec())
+}
+
+/// The pid in a local socket's peer's audit token (its sixth word), from the kernel at connect: which
+/// process connected, so a holder can require the one child it started (retrust).
+#[cfg(target_os = "macos")]
+pub fn peer_pid(socket: std::os::fd::BorrowedFd<'_>) -> Result<i32, String> {
+    let token = audit_token(socket)?;
+    let word = token
+        .get(20..24)
+        .ok_or_else(|| "its audit token is too short to name a pid".to_owned())?;
+    Ok(i32::from_ne_bytes([word[0], word[1], word[2], word[3]]))
+}
+
+/// The signature of the code behind a local socket's peer, if it meets `requirement`.
+#[cfg(target_os = "macos")]
+pub fn signature_of_peer(
+    socket: std::os::fd::BorrowedFd<'_>,
+    requirement: &str,
+) -> Result<Signature, String> {
+    macos::check(&macos::guest_by_audit(&audit_token(socket)?)?, requirement)
 }
 
 /// One row of a host's trust table.

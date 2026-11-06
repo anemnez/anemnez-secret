@@ -105,6 +105,36 @@ impl Successor for Remote {
     }
 }
 
+/// Accept the one connection that comes from process `pid` (the child the holder spawned, unreaped, so
+/// its pid cannot be reused), within `within`. A connection from any other process, however it is
+/// signed, is refused and dropped, and the wait goes on (D and F, 2026-11-06).
+pub fn accept_from(
+    listener: &UnixListener,
+    pid: i32,
+    within: Duration,
+) -> Result<UnixStream, String> {
+    listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                if crate::identity::peer_pid(std::os::fd::AsFd::as_fd(&stream)) == Ok(pid) {
+                    stream.set_nonblocking(false).map_err(|e| e.to_string())?;
+                    return Ok(stream);
+                }
+                drop(stream);
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => return Err(format!("the successor never connected: {e}")),
+        }
+    }
+}
+
 /// How the holder learns who connected: [`crate::identity::of_peer`] in use, a stand-in in tests.
 pub type Identify<'a> = &'a dyn Fn(&UnixStream) -> Result<Identity, String>;
 
@@ -143,20 +173,10 @@ pub fn to(
         .spawn()
         .map_err(|e| format!("the successor {} could not start: {e}", program.display()))?;
     let result = (|| {
-        listener.set_nonblocking(true).map_err(|e| e.to_string())?;
-        let deadline = std::time::Instant::now() + STEP;
-        let stream = loop {
-            match listener.accept() {
-                Ok((stream, _)) => break stream,
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::WouldBlock
-                        && std::time::Instant::now() < deadline =>
-                {
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                Err(e) => return Err(format!("the successor never connected: {e}")),
-            }
-        };
+        let pid = i32::try_from(child.id()).map_err(|e| e.to_string())?;
+        let stream = accept_from(&listener, pid, STEP)?;
+        // The one connection is taken: nothing else may reach the socket.
+        let _ = std::fs::remove_file(&socket);
         stream.set_nonblocking(false).map_err(|e| e.to_string())?;
         stream
             .set_read_timeout(Some(STEP))
@@ -288,6 +308,43 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    /// `SECRET.md#a-key-goes-only-to-a-checked-successor`: only the spawned child's connection is
+    /// taken. A process connecting first (this test process, however it is signed) is refused and
+    /// dropped, and the child's connection is still taken after it.
+    #[test]
+    fn only_the_spawned_childs_connection_is_taken() {
+        use std::io::Read;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let mut first = std::os::unix::net::UnixStream::connect(&path).unwrap();
+        let mut child = std::process::Command::new("/usr/bin/nc")
+            .arg("-U")
+            .arg(&path)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = i32::try_from(child.id()).unwrap();
+        let taken = super::accept_from(&listener, pid, std::time::Duration::from_secs(10))
+            .expect("the child's");
+        assert_eq!(
+            crate::identity::peer_pid(std::os::fd::AsFd::as_fd(&taken)),
+            Ok(pid)
+        );
+        // A dropped connection reads as closed; macOS may even refuse a timeout on it (EINVAL).
+        let _ = first.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+        let mut buf = [0u8; 1];
+        assert!(
+            first.read(&mut buf).map_or(true, |n| n == 0),
+            "the first connection was dropped"
+        );
+        let none = super::accept_from(&listener, 1, std::time::Duration::from_millis(100));
+        assert!(none.unwrap_err().contains("never connected"));
+        drop(child.kill());
+        drop(child.wait());
     }
 
     /// The child half, run by the test binary when started as the successor (never on its own).
