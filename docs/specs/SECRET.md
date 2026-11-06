@@ -30,9 +30,20 @@ is named by a service and an account the product chooses (a per-instance account
   `Unavailable`, never `NotHeld`, so no caller makes a new key over an old one.
 - **`held` never reads the value**, only the item's attributes.
 - **Tests never see a person's keychain**: they use a keychain file of their own.
-- Next (from Artichoke's keyring, F): a hand-off that writes `<item>.next` before the original goes,
-  every step idempotent; `made by: <designated requirement>` in the item's comment; and retrust to a
-  successor build, the same team from configuration, any other team only through the owner check.
+- **The maker is on the item.** `add` never overwrites, and writes `made by: <designated requirement>`
+  in the item's comment, which `maker` reads back without the value, so a refusal after a signing
+  change says whose item it is.
+
+<!-- claim: a-hand-off-never-leaves-a-key-unheld -->
+**A key carried across a signing change is held at every step** (from Artichoke's keyring, F). A
+build under a new identity cannot read the old one's item, so the old build hands the value over:
+the successor keeps it under `<item>.next` and proves it holds the same value, only then is the
+original removed, and only then does `.next` take the item's name. A run cut short anywhere finishes
+when run again. The proof is an HMAC-SHA-256 of the value under a fresh nonce the old build chose,
+so it gives a guesser nothing to test a value against, even a short secret.
+- Next: retrust, the successor as a checked child process. Its identity is judged by its
+  connection's audit token (`identity`, a socketpair, never a pid). The same team is allowed from
+  configuration; any other team only through the owner check (D, 2026-11-05).
 
 ## 3. Identity: one place a code signature is judged
 

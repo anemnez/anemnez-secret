@@ -9,6 +9,8 @@
 
 #[cfg(target_os = "macos")]
 pub mod custody;
+#[cfg(target_os = "macos")]
+pub mod handoff;
 pub mod identity;
 pub mod owner;
 pub mod secret;

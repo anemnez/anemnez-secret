@@ -19,6 +19,8 @@ const NOT_FOUND: i32 = -25300;
 const INTERACTION_NOT_ALLOWED: i32 = -25308;
 /// errSecAuthFailed: the keychain refused (locked, or this binary is not on the item's list).
 const AUTH_FAILED: i32 = -25293;
+/// errSecDuplicateItem.
+const DUPLICATE: i32 = -25299;
 
 /// Where an item lives: its service and its account.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -34,7 +36,18 @@ impl Item {
             account: account.into(),
         }
     }
+
+    /// The item a hand-off writes before the original goes: `<account>.next`, same service.
+    pub fn next(&self) -> Self {
+        Self {
+            service: self.service.clone(),
+            account: format!("{}.next", self.account),
+        }
+    }
 }
+
+/// How an item's comment names the build that made it, readable without the value.
+pub const MADE_BY: &str = "made by: ";
 
 impl std::fmt::Display for Item {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -50,6 +63,8 @@ pub enum CustodyError {
     /// The keychain cannot be read now (locked, or it refused without a dialog). Try again later;
     /// it is not a reason to make a new key.
     Unavailable { item: Item, status: i32 },
+    /// `add` found an item already there: it never overwrites.
+    Exists(Item),
     /// The keychain failed in its own words (an OS status, never the value).
     Store { item: Item, status: i32 },
 }
@@ -64,6 +79,7 @@ impl std::fmt::Display for CustodyError {
                     "{item} cannot be read now (OSStatus {status}: locked, or refused without a dialog)"
                 )
             }
+            Self::Exists(item) => write!(f, "{item} is already held, and add never overwrites"),
             Self::Store { item, status } => {
                 write!(f, "{item}: the keychain failed (OSStatus {status})")
             }
@@ -108,6 +124,7 @@ impl Keychain {
                 item: item.clone(),
                 status: e.code(),
             },
+            DUPLICATE => CustodyError::Exists(item.clone()),
             status => CustodyError::Store {
                 item: item.clone(),
                 status,
@@ -148,6 +165,64 @@ impl Keychain {
             }
             Err(e) => Err(Self::error(item, &e)),
         }
+    }
+
+    /// Keep `value` under `item` only if nothing is there: it never overwrites ([`CustodyError::Exists`]).
+    /// The item's comment names `made_by` (the writing build's designated requirement), so a refusal
+    /// after a signing change can say whose item it is without reading the value.
+    pub fn add(&self, item: &Item, value: &Secret, made_by: &str) -> Result<(), CustodyError> {
+        use security_framework::item::{ItemAddOptions, ItemAddValue, ItemClass, Location};
+        let data = value.expose(core_foundation::data::CFData::from_buffer);
+        let mut add = ItemAddOptions::new(ItemAddValue::Data {
+            class: ItemClass::generic_password(),
+            data,
+        });
+        add.set_service(&item.service)
+            .set_account_name(&item.account)
+            .set_label(format!("{} / {}", item.service, item.account))
+            .set_comment(format!("{MADE_BY}{made_by}"));
+        if let Some(keychain) = &self.keychain {
+            add.set_location(Location::FileKeychain(keychain.clone()));
+        }
+        add.add().map_err(|e| Self::error(item, &e))
+    }
+
+    /// The build that made `item`, as its comment names it: read from the item's attributes, never its
+    /// value. None when the item is absent or carries no such note.
+    pub fn maker(&self, item: &Item) -> Option<String> {
+        use security_framework::item::{ItemClass, ItemSearchOptions, Limit};
+        let mut search = ItemSearchOptions::new();
+        search
+            .class(ItemClass::generic_password())
+            .service(&item.service)
+            .account(&item.account)
+            .load_attributes(true)
+            .load_data(false);
+        search.limit(Limit::Max(1));
+        if let Some(keychain) = &self.keychain {
+            search.keychains(std::slice::from_ref(keychain));
+        }
+        let found = search.search().ok()?;
+        let attributes = found.first()?.simplify_dict()?;
+        attributes
+            .get("icmt")?
+            .strip_prefix(MADE_BY)
+            .map(str::to_owned)
+    }
+
+    /// Move this build's own `from` to `to`: written under `to` (never over an item there), read back,
+    /// and only then is `from` removed, so one of the two always holds the value.
+    pub fn rename(&self, from: &Item, to: &Item, made_by: &str) -> Result<(), CustodyError> {
+        let value = self.get(from)?;
+        self.add(to, &value, made_by)?;
+        let back = self.get(to)?;
+        if back.expose(|b| value.expose(|v| b != v)) {
+            return Err(CustodyError::Store {
+                item: to.clone(),
+                status: 0,
+            });
+        }
+        self.remove(from)
     }
 
     /// Whether `item` exists, found by its attributes alone: the value is never read into memory to
