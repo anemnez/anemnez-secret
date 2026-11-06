@@ -40,6 +40,18 @@ fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
         .into()
 }
 
+/// Whether `got` is the expected proof, compared in constant time; a proof of another length is refused.
+pub fn verify(expected: &Witness, got: &[u8]) -> bool {
+    if got.len() != expected.len() {
+        return false;
+    }
+    expected
+        .iter()
+        .zip(got)
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+        == 0
+}
+
 /// The proof of `value` under `nonce`.
 pub fn witness(value: &Secret, nonce: &[u8; 32]) -> Witness {
     value.expose(|v| hmac_sha256(nonce, v))
@@ -58,8 +70,9 @@ fn nonce() -> Result<[u8; 32], String> {
 /// The build a value is handed to: in use, the new binary as a checked child process (its identity
 /// judged by its connection's audit token, `identity`), and a stand-in in tests.
 pub trait Successor {
-    /// Keep `value` under `<item>.next` and prove it read it back.
-    fn receive(&mut self, value: &Secret, nonce: &[u8; 32]) -> Result<Witness, String>;
+    /// Keep `value` under `<item>.next` and prove it read it back. The proof arrives as bytes (over
+    /// the successor's connection, in use), checked by [`verify`].
+    fn receive(&mut self, value: &Secret, nonce: &[u8; 32]) -> Result<Vec<u8>, String>;
     /// Move `.next` to the item, once the original is gone.
     fn finish(&mut self) -> Result<(), String>;
 }
@@ -75,7 +88,7 @@ pub fn hand_off(
         Ok(value) => {
             let nonce = nonce()?;
             let theirs = successor.receive(&value, &nonce)?;
-            if theirs != witness(&value, &nonce) {
+            if !verify(&witness(&value, &nonce), &theirs) {
                 return Err(format!(
                     "the successor kept another value under {}; the original is left as it is",
                     item.next()
@@ -136,7 +149,7 @@ pub fn finish(keychain: &Keychain, item: &Item, made_by: &str) -> Result<(), Str
 
 #[cfg(test)]
 mod tests {
-    use super::{Successor, Witness, finish, hand_off, receive, witness};
+    use super::{Successor, finish, hand_off, receive, witness};
     use crate::Secret;
     use crate::custody::{Item, Keychain};
 
@@ -156,16 +169,21 @@ mod tests {
         item: Item,
         cut: bool,
         lie: bool,
+        short: bool,
     }
 
     impl Successor for Local<'_> {
-        fn receive(&mut self, value: &Secret, nonce: &[u8; 32]) -> Result<Witness, String> {
+        fn receive(&mut self, value: &Secret, nonce: &[u8; 32]) -> Result<Vec<u8>, String> {
             let w = receive(self.keychain, &self.item, value, nonce, NEW)?;
+            if self.short {
+                return Ok(w[..16].to_vec());
+            }
             Ok(if self.lie {
                 witness(&Secret::new(b"another".to_vec()), nonce)
             } else {
                 w
-            })
+            }
+            .to_vec())
         }
         fn finish(&mut self) -> Result<(), String> {
             if self.cut {
@@ -203,6 +221,7 @@ mod tests {
             item: item.clone(),
             cut: true,
             lie: false,
+            short: false,
         };
         assert!(
             hand_off(&k, &item, &mut cut).is_err(),
@@ -219,6 +238,7 @@ mod tests {
             item: item.clone(),
             cut: false,
             lie: false,
+            short: false,
         };
         hand_off(&k, &item, &mut again).expect("run again, it finishes");
         assert_eq!(held(&k, &item).as_deref(), Some(VALUE.as_bytes()));
@@ -232,6 +252,35 @@ mod tests {
         assert_eq!(held(&k, &item).as_deref(), Some(VALUE.as_bytes()));
     }
 
+    /// A proof of the wrong length is refused, and the original stays (D, 2026-11-06).
+    #[test]
+    fn a_proof_of_the_wrong_length_is_refused() {
+        let (_dir, k) = keychain();
+        let item = Item::new("ai.anemnez.example.role", "short@node");
+        k.add(&item, &Secret::new(VALUE.into()), "old").unwrap();
+        let mut short = Local {
+            keychain: &k,
+            item: item.clone(),
+            cut: false,
+            lie: false,
+            short: true,
+        };
+        assert!(
+            hand_off(&k, &item, &mut short)
+                .unwrap_err()
+                .contains("left as it is")
+        );
+        assert_eq!(
+            held(&k, &item).as_deref(),
+            Some(VALUE.as_bytes()),
+            "the original stays"
+        );
+        let w = witness(&Secret::new(VALUE.into()), &[7u8; 32]);
+        assert!(
+            super::verify(&w, &w) && !super::verify(&w, &w[..31]) && !super::verify(&w, &[0u8; 33])
+        );
+    }
+
     /// A successor that cannot prove it holds the same value never gets the original removed.
     #[test]
     fn a_successor_that_cannot_prove_the_value_leaves_the_original() {
@@ -243,6 +292,7 @@ mod tests {
             item: item.clone(),
             cut: false,
             lie: true,
+            short: false,
         };
         let refused = hand_off(&k, &item, &mut liar).unwrap_err();
         assert!(refused.contains("left as it is"), "{refused}");

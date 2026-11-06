@@ -9,8 +9,11 @@
 
 #[cfg(target_os = "macos")]
 pub mod custody;
+// Not exported until retrust lands: until the successor is checked by its audit token, a proof says only
+// that someone holding the value answered (D, 2026-11-06). The two ship as a pair.
 #[cfg(target_os = "macos")]
-pub mod handoff;
+#[allow(dead_code)]
+mod handoff;
 pub mod identity;
 pub mod owner;
 pub mod secret;
