@@ -113,6 +113,16 @@ impl Keychain {
         })
     }
 
+    /// An existing keychain file at `path`, unlocked with `password` (a proof's successor opens the
+    /// file its holder made).
+    pub fn open_at(path: &std::path::Path, password: &str) -> Result<Self, String> {
+        let mut keychain = SecKeychain::open(path).map_err(|e| e.to_string())?;
+        keychain.unlock(Some(password)).map_err(|e| e.to_string())?;
+        Ok(Self {
+            keychain: Some(keychain),
+        })
+    }
+
     fn keychains(&self) -> Option<Vec<SecKeychain>> {
         self.keychain.clone().map(|k| vec![k])
     }

@@ -96,3 +96,7 @@ spoken_for("a-hand-off-never-leaves-a-key-unheld", {
 	"handoff::tests::a_successor_that_cannot_prove_the_value_leaves_the_original",
 	"handoff::tests::finish_settles_every_state_it_finds",
 })
+spoken_for("a-key-goes-only-to-a-checked-successor", {
+	"retrust::tests::a_successor_is_allowed_by_identifier_then_team_then_the_owner",
+	"retrust::tests::a_key_moves_to_a_checked_child_and_never_to_another",
+})

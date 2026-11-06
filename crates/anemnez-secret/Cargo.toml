@@ -8,6 +8,8 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+# retrust: a private directory for the socket a successor connects to.
+tempfile = "3"
 sha2 = "0.10"
 # identity: getsockopt(LOCAL_PEERTOKEN).
 libc = "0.2"

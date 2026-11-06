@@ -41,9 +41,17 @@ the successor keeps it under `<item>.next` and proves it holds the same value, o
 original removed, and only then does `.next` take the item's name. A run cut short anywhere finishes
 when run again. The proof is an HMAC-SHA-256 of the value under a fresh nonce the old build chose,
 so it gives a guesser nothing to test a value against, even a short secret.
-- Next: retrust, the successor as a checked child process. Its identity is judged by its
-  connection's audit token (`identity`, a socketpair, never a pid). The same team is allowed from
-  configuration; any other team only through the owner check (D, 2026-11-05).
+
+<!-- claim: a-key-goes-only-to-a-checked-successor -->
+**A key goes only to a successor its holder has checked** (retrust; F's retrust, D's conditions). The
+holder starts the successor binary as a child and listens on a socket in a fresh directory only it
+can enter, named to the child in `ANEMNEZ_RETRUST_SOCKET`; the child connects. That connection's
+audit token is the child's own, read at connect, so `identity` judges the code that answered. A
+socketpair would not do: both its ends carry the token of the process that made it, the holder. The
+successor must answer as the identifier the holder expects; one of the holder's OWN team is allowed as
+configured, and one of any other team only through the owner check, which names the change. Only then
+does the hand-off run over the connection. A product's binary that finds `ANEMNEZ_RETRUST_SOCKET` set
+runs `retrust::serve` and nothing else.
 
 ## 3. Identity: one place a code signature is judged
 
