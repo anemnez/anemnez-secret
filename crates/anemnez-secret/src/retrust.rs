@@ -156,7 +156,8 @@ pub fn to(
         .prefix("retrust")
         .tempdir()
         .map_err(|e| e.to_string())?;
-    // Only this process may enter the directory, so only a process it started can find the socket.
+    // 0700 keeps other users out; any process of THIS user could still enter, so what limits the
+    // hand-off to one process is accept_from's pid check, not the directory (F, 2026-11-06).
     std::fs::set_permissions(
         dir.path(),
         std::os::unix::fs::PermissionsExt::from_mode(0o700),

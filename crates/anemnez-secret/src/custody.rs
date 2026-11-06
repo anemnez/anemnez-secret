@@ -13,6 +13,32 @@ use security_framework::os::macos::passwords::find_generic_password;
 
 use crate::Secret;
 
+/// Keychain dialogs. A non-interactive [`Keychain`] (every constructor but [`Keychain::login_interactive`])
+/// turns them off for the process when it is made, and nothing here turns them on again: an item whose
+/// access list doesn't admit the caller (another build's, the normal case after a signing change) then
+/// answers Unavailable at once, and a daemon never puts 'wants to use your confidential information' on
+/// the person's screen. Off once and never re-enabled is thread-safe and covers the legacy keychain
+/// APIs custody uses (F and D, 2026-11-06).
+mod quiet {
+    use security_framework_sys::keychain::SecKeychainSetUserInteractionAllowed;
+
+    /// Turn keychain dialogs off (`false`) or on (`true`) for this process.
+    pub(super) fn set(allowed: bool) {
+        // SAFETY: a plain call; it sets whether this process may show keychain dialogs.
+        unsafe { SecKeychainSetUserInteractionAllowed(u8::from(allowed)) };
+    }
+
+    /// Whether dialogs are allowed right now (tests).
+    #[cfg(test)]
+    pub(super) fn allowed() -> bool {
+        use security_framework_sys::keychain::SecKeychainGetUserInteractionAllowed;
+        let mut now = 1u8;
+        // SAFETY: a plain out-parameter read of the process's setting.
+        unsafe { SecKeychainGetUserInteractionAllowed(&mut now) };
+        now != 0
+    }
+}
+
 /// errSecItemNotFound.
 const NOT_FOUND: i32 = -25300;
 /// errSecInteractionNotAllowed: the keychain is locked and may not prompt.
@@ -96,28 +122,40 @@ pub struct Keychain {
 }
 
 impl Keychain {
-    /// The user's default keychain. Never in a test: tests use [`Keychain::create_at`].
+    /// The user's default keychain, non-interactive: keychain dialogs are off for the process from here
+    /// on. Never in a test: tests use [`Keychain::create_at`].
     pub fn login() -> Self {
+        quiet::set(false);
+        Self { keychain: None }
+    }
+
+    /// The user's default keychain WITH dialogs, for a command a person runs at the Mac (an explicit
+    /// adoption). Never in a daemon: it turns dialogs on for the whole process.
+    pub fn login_interactive() -> Self {
+        quiet::set(true);
         Self { keychain: None }
     }
 
     /// A keychain file of its own at `path`, made with `password` (proofs: never the login keychain).
+    /// Non-interactive, as [`Keychain::login`].
     pub fn create_at(path: &std::path::Path, password: &str) -> Result<Self, String> {
         let mut keychain = CreateOptions::new()
             .password(password)
             .create(path)
             .map_err(|e| e.to_string())?;
         keychain.unlock(Some(password)).map_err(|e| e.to_string())?;
+        quiet::set(false);
         Ok(Self {
             keychain: Some(keychain),
         })
     }
 
     /// An existing keychain file at `path`, unlocked with `password` (a proof's successor opens the
-    /// file its holder made).
+    /// file its holder made). Non-interactive, as [`Keychain::login`].
     pub fn open_at(path: &std::path::Path, password: &str) -> Result<Self, String> {
         let mut keychain = SecKeychain::open(path).map_err(|e| e.to_string())?;
         keychain.unlock(Some(password)).map_err(|e| e.to_string())?;
+        quiet::set(false);
         Ok(Self {
             keychain: Some(keychain),
         })
@@ -297,6 +335,62 @@ mod tests {
         k.remove(&item).unwrap();
         assert!(!k.held(&item).unwrap());
         assert!(matches!(k.remove(&item), Err(CustodyError::NotHeld(_))));
+    }
+
+    /// `SECRET.md#a-held-key-is-read-only-by-its-owning-build` (F, 2026-11-06): an item another code
+    /// identity made (here /usr/bin/security, so its access list admits only that tool) reads as
+    /// Unavailable at once, with no dialog and no block, and the process's dialog setting is restored.
+    #[test]
+    fn another_builds_item_reads_unavailable_without_a_dialog() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proof.keychain-db");
+        let k = Keychain::create_at(&path, "proof-only").unwrap();
+        assert!(
+            !super::quiet::allowed(),
+            "a non-interactive Keychain turns dialogs off"
+        );
+        let made = std::process::Command::new("/usr/bin/security")
+            .args([
+                "add-generic-password",
+                "-s",
+                "ai.anemnez.example",
+                "-a",
+                "theirs",
+                "-w",
+                "a-test-value",
+            ])
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(made.success(), "security made the item");
+        assert!(
+            k.held(&Item::new("ai.anemnez.example", "theirs")).unwrap(),
+            "it is there"
+        );
+        // D, 2026-11-06: two threads reading at once, each through its own Keychain; none blocks.
+        let (tx, rx) = std::sync::mpsc::channel();
+        for _ in 0..2 {
+            let (tx, path) = (tx.clone(), path.clone());
+            std::thread::spawn(move || {
+                let k = Keychain::open_at(&path, "proof-only").unwrap();
+                for _ in 0..20 {
+                    let _ = tx.send(
+                        k.get(&Item::new("ai.anemnez.example", "theirs"))
+                            .map(|_| ()),
+                    );
+                }
+            });
+        }
+        for _ in 0..40 {
+            let read = rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("answered without blocking on a dialog");
+            assert!(
+                matches!(read, Err(CustodyError::Unavailable { .. })),
+                "{read:?}"
+            );
+        }
+        assert!(!super::quiet::allowed(), "and dialogs stay off");
     }
 
     /// `SECRET.md#a-held-key-is-read-only-by-its-owning-build`: every error says what and why,
