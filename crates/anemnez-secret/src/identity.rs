@@ -9,6 +9,17 @@
 //! decision (fabric `ACCESS.md#no-decision-names-a-publisher`). A product's default trust is its own team,
 //! read from its own signature by [`own`], never from a file another process could edit.
 //!
+//! **Every check here BLOCKS, and may take seconds**: a strict validation re-hashes the binary. Never
+//! call [`of_peer`], [`of_peer_cached`], [`signature_of_peer`] or [`own`] on an async worker: run them
+//! through `spawn_blocking` or a small bounded pool, so a burst of connections queues instead of
+//! taking the threads other work needs (D, 2026-11-06: the swarm's quorum losses were raft starved by
+//! these checks on its runtime). The crate stays synchronous on purpose; callers wrap it.
+//!
+//! [`Verdicts`] caches a check per process: keyed by the peer's full audit token (its pid and
+//! pidversion, which changes on every exec), so a reconnecting process is checked once, and a reused
+//! pid or an exec'd process never meets a stale verdict. Only lasting answers are cached (a verified
+//! identity, or a refusal the signature itself gives), never a transient failure.
+//!
 //! A verdict vouches for the process that CONNECTED, at connect, not for whoever later holds the socket.
 //! A verified process that passes its connection on (`SCM_RIGHTS`, or an fd inherited without CLOEXEC;
 //! std and tokio sockets are CLOEXEC) lends its identity to the receiver, so a product never passes its
@@ -68,6 +79,7 @@ pub fn judge(signature: Signature) -> Result<Identity, String> {
 }
 
 /// The identity of the process at the other end of a local (unix) socket, or why it has none.
+/// BLOCKS, possibly for seconds: never on an async worker (see the module docs).
 #[cfg(target_os = "macos")]
 pub fn of_peer(socket: std::os::fd::BorrowedFd<'_>) -> Result<Identity, String> {
     judge(signature_of_peer(socket, APPLE_ANCHORED)?)
@@ -80,6 +92,7 @@ pub fn of_peer(_: std::os::fd::BorrowedFd<'_>) -> Result<Identity, String> {
 
 /// This process's own identity, by the same strict check (`SecCodeCopySelf`): what a product's default
 /// trust is built on ("my own team"), so it never names a publisher and never reads one from config.
+/// BLOCKS, possibly for seconds: never on an async worker (see the module docs).
 #[cfg(target_os = "macos")]
 pub fn own() -> Result<Identity, String> {
     judge(macos::check(&macos::guest_self()?, APPLE_ANCHORED)?)
@@ -88,6 +101,119 @@ pub fn own() -> Result<Identity, String> {
 #[cfg(not(target_os = "macos"))]
 pub fn own() -> Result<Identity, String> {
     Err("this OS has no code signatures to read".to_owned())
+}
+
+/// Refusals that come from the signature itself, so they hold for the life of the process and may be
+/// cached. Anything else (a token that cannot be read, a process gone, an OS error) is transient.
+const LASTING: [&str; 5] = [
+    "does not run with the hardened runtime",
+    " carries ",
+    "is not Apple-anchored and strictly valid",
+    "its signature names no identifier",
+    "its signature names no team",
+];
+
+fn lasting(refusal: &str) -> bool {
+    LASTING.iter().any(|p| refusal.contains(p))
+}
+
+/// One cached verdict: when it was checked, and what the check said.
+type Held = std::collections::HashMap<Vec<u8>, (std::time::Instant, Result<Identity, String>)>;
+
+/// Checks per process, keyed by the full audit token (see the module docs). Plain std: the lock is
+/// never held while a check runs.
+pub struct Verdicts {
+    /// How long a verified identity is kept.
+    ttl: std::time::Duration,
+    /// How long a refusal is kept: shorter, since a running process can fail strict validity briefly
+    /// while its binary on disk is being replaced (an upgrade), and that must clear quickly (D,
+    /// 2026-11-06).
+    refused_ttl: std::time::Duration,
+    cap: usize,
+    held: std::sync::Mutex<Held>,
+}
+
+impl Verdicts {
+    /// A cache that keeps a verified identity for `ttl`, a refusal for `refused_ttl`, and at most `cap`
+    /// verdicts (say 10 min, 60 s and 1024).
+    pub fn new(ttl: std::time::Duration, refused_ttl: std::time::Duration, cap: usize) -> Self {
+        Self {
+            ttl,
+            refused_ttl,
+            cap,
+            held: std::sync::Mutex::default(),
+        }
+    }
+
+    /// The verdict for `token`: the cached one while it is fresh, else `check`'s, cached when it is
+    /// lasting.
+    pub fn get_or_check(
+        &self,
+        token: &[u8],
+        check: impl FnOnce() -> Result<Identity, String>,
+    ) -> Result<Identity, String> {
+        let now = std::time::Instant::now();
+        if let Some((at, verdict)) = self.lock().get(token)
+            && self.fresh(verdict, *at, now)
+        {
+            return verdict.clone();
+        }
+        let verdict = check();
+        if verdict.as_ref().err().is_none_or(|e| lasting(e)) {
+            let mut held = self.lock();
+            if held.len() >= self.cap {
+                held.retain(|_, (at, verdict)| self.fresh(verdict, *at, now));
+                if held.len() >= self.cap
+                    && let Some(oldest) = held
+                        .iter()
+                        .min_by_key(|(_, (at, _))| *at)
+                        .map(|(k, _)| k.clone())
+                {
+                    held.remove(&oldest);
+                }
+            }
+            held.insert(token.to_vec(), (now, verdict.clone()));
+        }
+        verdict
+    }
+
+    /// Whether a verdict checked at `at` still holds at `now`: a verified one for `ttl`, a refusal for
+    /// the shorter `refused_ttl`.
+    fn fresh(
+        &self,
+        verdict: &Result<Identity, String>,
+        at: std::time::Instant,
+        now: std::time::Instant,
+    ) -> bool {
+        let ttl = if verdict.is_ok() {
+            self.ttl
+        } else {
+            self.refused_ttl
+        };
+        now.duration_since(at) < ttl
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Held> {
+        self.held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// [`of_peer`] through `verdicts`: the audit token is read per connection (cheap), and the code-signing
+/// check runs only on a miss. BLOCKS on a miss, possibly for seconds.
+#[cfg(target_os = "macos")]
+pub fn of_peer_cached(
+    verdicts: &Verdicts,
+    socket: std::os::fd::BorrowedFd<'_>,
+) -> Result<Identity, String> {
+    let token = audit_token(socket)?;
+    verdicts.get_or_check(&token, || {
+        judge(macos::check(
+            &macos::guest_by_audit(&token)?,
+            APPLE_ANCHORED,
+        )?)
+    })
 }
 
 /// A local socket's peer's audit token, as the kernel recorded it at connect: an `audit_token_t`.
@@ -368,6 +494,65 @@ mod macos {
 
 #[cfg(test)]
 mod tests {
+    /// (D, 2026-11-06) a verdict is checked once per process: a verified identity and a refusal the
+    /// signature gives are cached per audit token; a transient failure is never cached; another token
+    /// is another check; a stale verdict is checked again; and the cache keeps to its cap.
+    #[test]
+    fn a_process_is_checked_once_and_only_lasting_verdicts_are_kept() {
+        use std::cell::Cell;
+        let v = super::Verdicts::new(
+            std::time::Duration::from_secs(600),
+            std::time::Duration::from_secs(60),
+            2,
+        );
+        let runs = Cell::new(0);
+        let ok = || {
+            runs.set(runs.get() + 1);
+            Ok(super::Identity {
+                team: "TEAM".into(),
+                identifier: "ai.anemnez.x".into(),
+            })
+        };
+        assert!(v.get_or_check(b"tok-a", ok).is_ok());
+        assert!(v.get_or_check(b"tok-a", ok).is_ok());
+        assert_eq!(runs.get(), 1, "verified: checked once");
+        let refused = || {
+            runs.set(runs.get() + 1);
+            Err("ai.anemnez.x does not run with the hardened runtime".to_owned())
+        };
+        assert!(v.get_or_check(b"tok-b", refused).is_err());
+        assert!(v.get_or_check(b"tok-b", refused).is_err());
+        assert_eq!(runs.get(), 2, "a lasting refusal: checked once");
+        let transient = || {
+            runs.set(runs.get() + 1);
+            Err("its running code cannot be found (OSStatus -67068)".to_owned())
+        };
+        let _ = v.get_or_check(b"tok-c", transient);
+        let _ = v.get_or_check(b"tok-c", transient);
+        assert_eq!(runs.get(), 4, "a transient failure: never cached");
+        assert!(v.lock().len() <= 2, "the cap holds: {}", v.lock().len());
+        let stale = super::Verdicts::new(std::time::Duration::ZERO, std::time::Duration::ZERO, 8);
+        let _ = stale.get_or_check(b"tok-d", ok);
+        let _ = stale.get_or_check(b"tok-d", ok);
+        assert_eq!(runs.get(), 6, "a stale verdict is checked again");
+        // D, 2026-11-06: a refusal clears sooner than a verified identity (a binary mid-swap).
+        let short = super::Verdicts::new(
+            std::time::Duration::from_secs(600),
+            std::time::Duration::ZERO,
+            8,
+        );
+        let _ = short.get_or_check(b"tok-e", ok);
+        let _ = short.get_or_check(b"tok-e", ok);
+        assert_eq!(runs.get(), 7, "verified: still held");
+        let _ = short.get_or_check(b"tok-f", refused);
+        let _ = short.get_or_check(b"tok-f", refused);
+        assert_eq!(
+            runs.get(),
+            9,
+            "refused: re-checked once its shorter time is up"
+        );
+    }
+
     use super::*;
 
     const TEAM: &str = "P9DJA3JCKP";
