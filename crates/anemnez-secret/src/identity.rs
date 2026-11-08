@@ -217,8 +217,10 @@ pub fn of_peer_cached(
 }
 
 /// A local socket's peer's audit token, as the kernel recorded it at connect: an `audit_token_t`.
+/// Public so a daemon can hand it to Agora's `WhoIs` (agora-client), which names a process by this
+/// token and never by a pid (LADON.md §5b). Cheap: one getsockopt, no signature check.
 #[cfg(target_os = "macos")]
-fn audit_token(socket: std::os::fd::BorrowedFd<'_>) -> Result<Vec<u8>, String> {
+pub fn audit_token(socket: std::os::fd::BorrowedFd<'_>) -> Result<Vec<u8>, String> {
     use std::os::fd::AsRawFd;
     // sys/un.h: SOL_LOCAL 0, LOCAL_PEERTOKEN 6, an audit_token_t of eight u32s.
     let mut token = [0u8; 32];
@@ -691,6 +693,21 @@ mod tests {
     fn a_process_knows_its_own_identity_by_the_same_check() {
         let mine = own().expect_err("an ad hoc test binary");
         assert!(mine.contains("not Apple-anchored"), "{mine}");
+    }
+
+    /// The token a daemon hands Agora's WhoIs: the kernel's 32 bytes, naming the process at the other
+    /// end (here this test binary, so its pid word is this process's).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_peers_audit_token_is_the_kernels_32_bytes_naming_that_process() {
+        use std::os::fd::AsFd;
+        let (ours, _theirs) = std::os::unix::net::UnixStream::pair().expect("a pair");
+        let token = audit_token(ours.as_fd()).expect("a connected socket has a peer token");
+        assert_eq!(token.len(), 32, "an audit_token_t is eight u32s");
+        assert_eq!(
+            peer_pid(ours.as_fd()),
+            Ok(i32::try_from(std::process::id()).unwrap())
+        );
     }
 
     /// The audit-token path, for real: a socket pair inside this test, so the peer is this test binary,

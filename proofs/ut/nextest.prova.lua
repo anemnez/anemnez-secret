@@ -86,6 +86,7 @@ spoken_for("a-caller-is-known-by-its-code-signature", {
 	"identity::tests::the_trust_table_admits_an_owner_and_a_scoped_entry_and_nothing_else",
 	"identity::tests::a_running_codes_signature_is_read_only_after_it_is_validated",
 	"identity::tests::a_peers_audit_token_finds_its_code_and_an_ad_hoc_peer_is_no_identity",
+	"identity::tests::a_peers_audit_token_is_the_kernels_32_bytes_naming_that_process",
 	"identity::tests::a_process_knows_its_own_identity_by_the_same_check",
 })
 spoken_for("a-held-key-is-read-only-by-its-owning-build", {
