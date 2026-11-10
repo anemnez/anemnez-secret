@@ -13,6 +13,9 @@
 # one followed by cancelled (and therefore unattested) cases.
 [profile.prova]
 fail-fast = false
+# A hung test is killed, so one hang can't eat the gate (prova-project-standards v2): slow after
+# 60 s, killed after five periods. These tests finish in seconds.
+slow-timeout = { period = "60s", terminate-after = 5 }
 
 [profile.prova.junit]
 path = "junit.xml"

@@ -72,18 +72,12 @@ pub struct Item {
 
 impl Item {
     pub fn new(service: impl Into<String>, account: impl Into<String>) -> Self {
-        Self {
-            service: service.into(),
-            account: account.into(),
-        }
+        Self { service: service.into(), account: account.into() }
     }
 
     /// The item a hand-off writes before the original goes: `<account>.next`, same service.
     pub fn next(&self) -> Self {
-        Self {
-            service: self.service.clone(),
-            account: format!("{}.next", self.account),
-        }
+        Self { service: self.service.clone(), account: format!("{}.next", self.account) }
     }
 }
 
@@ -115,10 +109,7 @@ impl std::fmt::Display for CustodyError {
         match self {
             Self::NotHeld(item) => write!(f, "{item} is not held"),
             Self::Unavailable { item, status } => {
-                write!(
-                    f,
-                    "{item} cannot be read now (OSStatus {status}: locked, or refused without a dialog)"
-                )
+                write!(f, "{item} cannot be read now (OSStatus {status}: locked, or refused without a dialog)")
             }
             Self::Exists(item) => write!(f, "{item} is already held, and add never overwrites"),
             Self::Store { item, status } => {
@@ -155,15 +146,10 @@ impl Keychain {
     /// A keychain file of its own at `path`, made with `password` (proofs: never the login keychain).
     /// Non-interactive, as [`Keychain::login`].
     pub fn create_at(path: &std::path::Path, password: &str) -> Result<Self, String> {
-        let mut keychain = CreateOptions::new()
-            .password(password)
-            .create(path)
-            .map_err(|e| e.to_string())?;
+        let mut keychain = CreateOptions::new().password(password).create(path).map_err(|e| e.to_string())?;
         keychain.unlock(Some(password)).map_err(|e| e.to_string())?;
         quiet::off();
-        Ok(Self {
-            keychain: Some(keychain),
-        })
+        Ok(Self { keychain: Some(keychain) })
     }
 
     /// An existing keychain file at `path`, unlocked with `password` (a proof's successor opens the
@@ -172,9 +158,7 @@ impl Keychain {
         let mut keychain = SecKeychain::open(path).map_err(|e| e.to_string())?;
         keychain.unlock(Some(password)).map_err(|e| e.to_string())?;
         quiet::off();
-        Ok(Self {
-            keychain: Some(keychain),
-        })
+        Ok(Self { keychain: Some(keychain) })
     }
 
     fn keychains(&self) -> Option<Vec<SecKeychain>> {
@@ -184,15 +168,9 @@ impl Keychain {
     fn error(item: &Item, e: &security_framework::base::Error) -> CustodyError {
         match e.code() {
             NOT_FOUND => CustodyError::NotHeld(item.clone()),
-            INTERACTION_NOT_ALLOWED | AUTH_FAILED => CustodyError::Unavailable {
-                item: item.clone(),
-                status: e.code(),
-            },
+            INTERACTION_NOT_ALLOWED | AUTH_FAILED => CustodyError::Unavailable { item: item.clone(), status: e.code() },
             DUPLICATE => CustodyError::Exists(item.clone()),
-            status => CustodyError::Store {
-                item: item.clone(),
-                status,
-            },
+            status => CustodyError::Store { item: item.clone(), status },
         }
     }
 
@@ -200,12 +178,10 @@ impl Keychain {
     /// item's access list names this binary's code signature.
     pub fn put(&self, item: &Item, value: Secret) -> Result<(), CustodyError> {
         let written = match &self.keychain {
-            Some(keychain) => {
-                value.expose(|v| keychain.set_generic_password(&item.service, &item.account, v))
+            Some(keychain) => value.expose(|v| keychain.set_generic_password(&item.service, &item.account, v)),
+            None => {
+                value.expose(|v| security_framework::passwords::set_generic_password(&item.service, &item.account, v))
             }
-            None => value.expose(|v| {
-                security_framework::passwords::set_generic_password(&item.service, &item.account, v)
-            }),
         };
         written.map_err(|e| Self::error(item, &e))
     }
@@ -237,10 +213,7 @@ impl Keychain {
     pub fn add(&self, item: &Item, value: &Secret, made_by: &str) -> Result<(), CustodyError> {
         use security_framework::item::{ItemAddOptions, ItemAddValue, ItemClass, Location};
         let data = value.expose(core_foundation::data::CFData::from_buffer);
-        let mut add = ItemAddOptions::new(ItemAddValue::Data {
-            class: ItemClass::generic_password(),
-            data,
-        });
+        let mut add = ItemAddOptions::new(ItemAddValue::Data { class: ItemClass::generic_password(), data });
         add.set_service(&item.service)
             .set_account_name(&item.account)
             .set_label(format!("{} / {}", item.service, item.account))
@@ -268,10 +241,7 @@ impl Keychain {
         }
         let found = search.search().ok()?;
         let attributes = found.first()?.simplify_dict()?;
-        attributes
-            .get("icmt")?
-            .strip_prefix(MADE_BY)
-            .map(str::to_owned)
+        attributes.get("icmt")?.strip_prefix(MADE_BY).map(str::to_owned)
     }
 
     /// Move this build's own `from` to `to`: written under `to` (never over an item there), read back,
@@ -281,10 +251,7 @@ impl Keychain {
         self.add(to, &value, made_by)?;
         let back = self.get(to)?;
         if back.expose(|b| value.expose(|v| b != v)) {
-            return Err(CustodyError::Store {
-                item: to.clone(),
-                status: 0,
-            });
+            return Err(CustodyError::Store { item: to.clone(), status: 0 });
         }
         self.remove(from)
     }
@@ -321,8 +288,8 @@ mod tests {
 
     fn keychain() -> (tempfile::TempDir, Keychain) {
         let dir = tempfile::tempdir().expect("scratch");
-        let k = Keychain::create_at(&dir.path().join("proof.keychain-db"), "proof-only")
-            .expect("a keychain of its own");
+        let k =
+            Keychain::create_at(&dir.path().join("proof.keychain-db"), "proof-only").expect("a keychain of its own");
         (dir, k)
     }
 
@@ -334,16 +301,10 @@ mod tests {
         let (_dir, k) = keychain();
         let item = Item::new("ai.anemnez.example.role", "promoter@01a195f1");
         assert!(!k.held(&item).unwrap());
-        assert_eq!(
-            k.get(&item).unwrap_err(),
-            CustodyError::NotHeld(item.clone())
-        );
+        assert_eq!(k.get(&item).unwrap_err(), CustodyError::NotHeld(item.clone()));
         k.put(&item, Secret::new(VALUE.into())).unwrap();
         assert!(k.held(&item).unwrap());
-        assert_eq!(
-            k.get(&item).unwrap().expose(|v| v.to_vec()),
-            VALUE.as_bytes()
-        );
+        assert_eq!(k.get(&item).unwrap().expose(|v| v.to_vec()), VALUE.as_bytes());
         k.put(&item, Secret::new(b"rotated".to_vec())).unwrap();
         assert_eq!(k.get(&item).unwrap().expose(|v| v.to_vec()), b"rotated");
         let other = Item::new("ai.anemnez.example.role", "promoter@another-node");
@@ -361,28 +322,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("proof.keychain-db");
         let k = Keychain::create_at(&path, "proof-only").unwrap();
-        assert!(
-            !super::quiet::allowed(),
-            "a non-interactive Keychain turns dialogs off"
-        );
+        assert!(!super::quiet::allowed(), "a non-interactive Keychain turns dialogs off");
         let made = std::process::Command::new("/usr/bin/security")
-            .args([
-                "add-generic-password",
-                "-s",
-                "ai.anemnez.example",
-                "-a",
-                "theirs",
-                "-w",
-                "a-test-value",
-            ])
+            .args(["add-generic-password", "-s", "ai.anemnez.example", "-a", "theirs", "-w", "a-test-value"])
             .arg(&path)
             .status()
             .unwrap();
         assert!(made.success(), "security made the item");
-        assert!(
-            k.held(&Item::new("ai.anemnez.example", "theirs")).unwrap(),
-            "it is there"
-        );
+        assert!(k.held(&Item::new("ai.anemnez.example", "theirs")).unwrap(), "it is there");
         // D, 2026-11-06: two threads reading at once, each through its own Keychain; none blocks.
         let (tx, rx) = std::sync::mpsc::channel();
         for _ in 0..2 {
@@ -390,21 +337,14 @@ mod tests {
             std::thread::spawn(move || {
                 let k = Keychain::open_at(&path, "proof-only").unwrap();
                 for _ in 0..20 {
-                    let _ = tx.send(
-                        k.get(&Item::new("ai.anemnez.example", "theirs"))
-                            .map(|_| ()),
-                    );
+                    let _ = tx.send(k.get(&Item::new("ai.anemnez.example", "theirs")).map(|_| ()));
                 }
             });
         }
         for _ in 0..40 {
-            let read = rx
-                .recv_timeout(std::time::Duration::from_secs(10))
-                .expect("answered without blocking on a dialog");
-            assert!(
-                matches!(read, Err(CustodyError::Unavailable { .. })),
-                "{read:?}"
-            );
+            let read =
+                rx.recv_timeout(std::time::Duration::from_secs(10)).expect("answered without blocking on a dialog");
+            assert!(matches!(read, Err(CustodyError::Unavailable { .. })), "{read:?}");
         }
         assert!(!super::quiet::allowed(), "and dialogs stay off");
     }
@@ -414,8 +354,7 @@ mod tests {
     #[test]
     fn an_interactive_keychain_is_refused_once_a_quiet_one_exists() {
         let dir = tempfile::tempdir().unwrap();
-        let _quiet =
-            Keychain::create_at(&dir.path().join("proof.keychain-db"), "proof-only").unwrap();
+        let _quiet = Keychain::create_at(&dir.path().join("proof.keychain-db"), "proof-only").unwrap();
         let refused = Keychain::login_interactive().map(|_| ()).unwrap_err();
         assert!(refused.contains("non-interactive"), "{refused}");
         assert!(!super::quiet::allowed(), "dialogs stay off");
@@ -434,25 +373,13 @@ mod tests {
             Keychain::error(&item, &security_framework::base::Error::from_code(-25293)),
             Keychain::error(&item, &security_framework::base::Error::from_code(-1)),
         ];
-        assert!(
-            matches!(errors[1], CustodyError::Unavailable { .. }),
-            "locked is unavailable"
-        );
-        assert!(
-            matches!(errors[2], CustodyError::Unavailable { .. }),
-            "refused is unavailable"
-        );
+        assert!(matches!(errors[1], CustodyError::Unavailable { .. }), "locked is unavailable");
+        assert!(matches!(errors[2], CustodyError::Unavailable { .. }), "refused is unavailable");
         assert!(matches!(errors[3], CustodyError::Store { .. }));
         for e in &errors {
             let said = format!("{e} {e:?}");
-            assert!(
-                !said.contains("SECRET") && !said.contains("ZZZtop"),
-                "{said}"
-            );
-            assert!(
-                said.contains("ai.anemnez.example"),
-                "it names the item: {said}"
-            );
+            assert!(!said.contains("SECRET") && !said.contains("ZZZtop"), "{said}");
+            assert!(said.contains("ai.anemnez.example"), "it names the item: {said}");
         }
     }
 }
