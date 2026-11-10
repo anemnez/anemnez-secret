@@ -17,6 +17,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # The suite pins `project-standards` to `ssh://git@github.com/anemnez/…`. A developer's key
+      # already opens that; a runner's does not. This rewrites it onto a token at the git layer, so
+      # the SAME pin resolves in both places; without it the run dies at dependency resolution.
+      # ANEMNEZ_CI_TOKEN is an organization secret, so it is already available to this repository.
+      - uses: anemnez/prova-project-standards/.github/actions/anemnez-git-auth@v1
+        with:
+          token: ${{ secrets.ANEMNEZ_CI_TOKEN }}
       - uses: Swatinem/rust-cache@v2
 
       - name: Install cargo-nextest and cargo-llvm-cov

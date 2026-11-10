@@ -39,24 +39,14 @@ impl OwnerCheck for DeviceOwner {
         // SAFETY: a fresh context, used on this thread for this one evaluation.
         let context = unsafe { LAContext::new() };
         // SAFETY: a valid context and a policy constant.
-        unsafe { context.canEvaluatePolicy_error(policy) }.map_err(|e| {
-            format!(
-                "the owner check is not available: {}",
-                e.localizedDescription()
-            )
-        })?;
+        unsafe { context.canEvaluatePolicy_error(policy) }
+            .map_err(|e| format!("the owner check is not available: {}", e.localizedDescription()))?;
         let (tx, rx) = std::sync::mpsc::channel();
         let reply = block2::RcBlock::new(move |ok: Bool, _error: *mut NSError| {
             let _ = tx.send(ok.as_bool());
         });
         // SAFETY: the reason and the reply block outlive the call; the block only sends on a channel.
-        unsafe {
-            context.evaluatePolicy_localizedReason_reply(
-                policy,
-                &NSString::from_str(reason),
-                &reply,
-            )
-        };
+        unsafe { context.evaluatePolicy_localizedReason_reply(policy, &NSString::from_str(reason), &reply) };
         match rx.recv_timeout(self.timeout) {
             Ok(true) => Ok(()),
             Ok(false) => Err("the owner did not confirm it".into()),
@@ -77,21 +67,14 @@ pub mod tests {
 
     impl StandIn {
         pub fn new(confirms: bool) -> Self {
-            Self {
-                confirms,
-                asked: Default::default(),
-            }
+            Self { confirms, asked: Default::default() }
         }
     }
 
     impl OwnerCheck for StandIn {
         fn confirm(&self, reason: &str) -> Result<(), String> {
             self.asked.borrow_mut().push(reason.into());
-            if self.confirms {
-                Ok(())
-            } else {
-                Err("the stand-in refused".into())
-            }
+            if self.confirms { Ok(()) } else { Err("the stand-in refused".into()) }
         }
     }
 
@@ -102,11 +85,8 @@ pub mod tests {
     #[test]
     #[ignore = "asks a person: run by hand"]
     fn the_real_owner_check_asks_the_person() {
-        let check = super::DeviceOwner {
-            timeout: std::time::Duration::from_secs(60),
-        };
-        let verdict =
-            check.confirm("prove the anemnez-secret owner check (a by-hand test; nothing changes)");
+        let check = super::DeviceOwner { timeout: std::time::Duration::from_secs(60) };
+        let verdict = check.confirm("prove the anemnez-secret owner check (a by-hand test; nothing changes)");
         eprintln!("the owner check answered: {verdict:?}");
     }
 }

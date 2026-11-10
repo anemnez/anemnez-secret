@@ -62,22 +62,12 @@ pub struct Signature {
 /// and none of [`TAMPERING`]. Err says why not.
 pub fn judge(signature: Signature) -> Result<Identity, String> {
     if signature.flags & HARDENED_RUNTIME == 0 {
-        return Err(format!(
-            "{} does not run with the hardened runtime",
-            signature.identifier
-        ));
+        return Err(format!("{} does not run with the hardened runtime", signature.identifier));
     }
-    if let Some(entitlement) = signature
-        .entitlements
-        .iter()
-        .find(|e| TAMPERING.contains(&e.as_str()))
-    {
+    if let Some(entitlement) = signature.entitlements.iter().find(|e| TAMPERING.contains(&e.as_str())) {
         return Err(format!("{} carries {entitlement}", signature.identifier));
     }
-    Ok(Identity {
-        team: signature.team,
-        identifier: signature.identifier,
-    })
+    Ok(Identity { team: signature.team, identifier: signature.identifier })
 }
 
 /// The identity of the process at the other end of a local (unix) socket, or why it has none.
@@ -139,12 +129,7 @@ impl Verdicts {
     /// A cache that keeps a verified identity for `ttl`, a refusal for `refused_ttl`, and at most `cap`
     /// verdicts (say 10 min, 60 s and 1024).
     pub fn new(ttl: std::time::Duration, refused_ttl: std::time::Duration, cap: usize) -> Self {
-        Self {
-            ttl,
-            refused_ttl,
-            cap,
-            held: std::sync::Mutex::default(),
-        }
+        Self { ttl, refused_ttl, cap, held: std::sync::Mutex::default() }
     }
 
     /// The verdict for `token`: the cached one while it is fresh, else `check`'s, cached when it is
@@ -166,10 +151,7 @@ impl Verdicts {
             if held.len() >= self.cap {
                 held.retain(|_, (at, verdict)| self.fresh(verdict, *at, now));
                 if held.len() >= self.cap
-                    && let Some(oldest) = held
-                        .iter()
-                        .min_by_key(|(_, (at, _))| *at)
-                        .map(|(k, _)| k.clone())
+                    && let Some(oldest) = held.iter().min_by_key(|(_, (at, _))| *at).map(|(k, _)| k.clone())
                 {
                     held.remove(&oldest);
                 }
@@ -181,41 +163,22 @@ impl Verdicts {
 
     /// Whether a verdict checked at `at` still holds at `now`: a verified one for `ttl`, a refusal for
     /// the shorter `refused_ttl`.
-    fn fresh(
-        &self,
-        verdict: &Result<Identity, String>,
-        at: std::time::Instant,
-        now: std::time::Instant,
-    ) -> bool {
-        let ttl = if verdict.is_ok() {
-            self.ttl
-        } else {
-            self.refused_ttl
-        };
+    fn fresh(&self, verdict: &Result<Identity, String>, at: std::time::Instant, now: std::time::Instant) -> bool {
+        let ttl = if verdict.is_ok() { self.ttl } else { self.refused_ttl };
         now.duration_since(at) < ttl
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Held> {
-        self.held
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.held.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
 /// [`of_peer`] through `verdicts`: the audit token is read per connection (cheap), and the code-signing
 /// check runs only on a miss. BLOCKS on a miss, possibly for seconds.
 #[cfg(target_os = "macos")]
-pub fn of_peer_cached(
-    verdicts: &Verdicts,
-    socket: std::os::fd::BorrowedFd<'_>,
-) -> Result<Identity, String> {
+pub fn of_peer_cached(verdicts: &Verdicts, socket: std::os::fd::BorrowedFd<'_>) -> Result<Identity, String> {
     let token = audit_token(socket)?;
-    verdicts.get_or_check(&token, || {
-        judge(macos::check(
-            &macos::guest_by_audit(&token)?,
-            APPLE_ANCHORED,
-        )?)
-    })
+    verdicts.get_or_check(&token, || judge(macos::check(&macos::guest_by_audit(&token)?, APPLE_ANCHORED)?))
 }
 
 /// A local socket's peer's whole audit token (`audit_token_t`'s eight words: auid, euid, egid, ruid,
@@ -246,15 +209,10 @@ pub fn audit_token_words(socket: std::os::fd::BorrowedFd<'_>) -> Result<[u32; 8]
         )
     };
     if rc != 0 {
-        return Err(format!(
-            "its audit token cannot be read: {}",
-            std::io::Error::last_os_error()
-        ));
+        return Err(format!("its audit token cannot be read: {}", std::io::Error::last_os_error()));
     }
     if len as usize != std::mem::size_of_val(&token) {
-        return Err(format!(
-            "LOCAL_PEERTOKEN answered {len} bytes, not an audit token"
-        ));
+        return Err(format!("LOCAL_PEERTOKEN answered {len} bytes, not an audit token"));
     }
     Ok(token)
 }
@@ -263,10 +221,7 @@ pub fn audit_token_words(socket: std::os::fd::BorrowedFd<'_>) -> Result<[u32; 8]
 /// `WhoIs` (agora-client), which names a process by this token and never by a pid (LADON.md §5b).
 #[cfg(target_os = "macos")]
 pub fn audit_token(socket: std::os::fd::BorrowedFd<'_>) -> Result<Vec<u8>, String> {
-    Ok(audit_token_words(socket)?
-        .iter()
-        .flat_map(|w| w.to_ne_bytes())
-        .collect())
+    Ok(audit_token_words(socket)?.iter().flat_map(|w| w.to_ne_bytes()).collect())
 }
 
 /// A process, exactly: its pid and the version of that pid (a pid reused, or an exec, is another version).
@@ -287,10 +242,7 @@ impl Token {
     fn from_words(t: &[u32; 8]) -> Option<Self> {
         // audit_token_to_euid, _pid and _pidversion (bsm/libbsm.h): words 1, 5 and 7.
         // SAFETY: geteuid has no preconditions.
-        (t[1] == unsafe { libc::geteuid() }).then(|| Self {
-            pid: t[5] as i32,
-            pidversion: t[7] as i32,
-        })
+        (t[1] == unsafe { libc::geteuid() }).then(|| Self { pid: t[5] as i32, pidversion: t[7] as i32 })
     }
 }
 
@@ -298,8 +250,7 @@ impl Token {
 /// [`audit_token_words`]), refused unless it runs as this process's effective user.
 #[cfg(target_os = "macos")]
 pub fn peer(socket: std::os::fd::BorrowedFd<'_>) -> Result<Token, String> {
-    Token::from_words(&audit_token_words(socket)?)
-        .ok_or_else(|| "the peer runs as another user".to_owned())
+    Token::from_words(&audit_token_words(socket)?).ok_or_else(|| "the peer runs as another user".to_owned())
 }
 
 /// The process running as `pid` now, or `None` when there is none or it belongs to another user
@@ -312,11 +263,7 @@ pub fn current(pid: i32) -> Option<Token> {
     unsafe extern "C" {
         /// This task's own port: what the `mach_task_self()` macro reads.
         static mach_task_self_: libc::mach_port_t;
-        fn task_name_for_pid(
-            target: libc::mach_port_t,
-            pid: libc::c_int,
-            name: *mut libc::mach_port_t,
-        ) -> libc::c_int;
+        fn task_name_for_pid(target: libc::mach_port_t, pid: libc::c_int, name: *mut libc::mach_port_t) -> libc::c_int;
         fn mach_port_deallocate(task: libc::mach_port_t, name: libc::mach_port_t) -> libc::c_int;
     }
     let mut name: libc::mach_port_t = 0;
@@ -328,12 +275,7 @@ pub fn current(pid: i32) -> Option<Token> {
         }
         let mut token = [0u32; 8];
         let mut count = TASK_AUDIT_TOKEN_COUNT;
-        let rc = libc::task_info(
-            name,
-            TASK_AUDIT_TOKEN,
-            token.as_mut_ptr().cast(),
-            &mut count,
-        );
+        let rc = libc::task_info(name, TASK_AUDIT_TOKEN, token.as_mut_ptr().cast(), &mut count);
         mach_port_deallocate(me, name);
         // A short answer is no token, never a zero-filled one.
         if rc != 0 || count != TASK_AUDIT_TOKEN_COUNT {
@@ -348,18 +290,13 @@ pub fn current(pid: i32) -> Option<Token> {
 #[cfg(target_os = "macos")]
 pub fn peer_pid(socket: std::os::fd::BorrowedFd<'_>) -> Result<i32, String> {
     let token = audit_token(socket)?;
-    let word = token
-        .get(20..24)
-        .ok_or_else(|| "its audit token is too short to name a pid".to_owned())?;
+    let word = token.get(20..24).ok_or_else(|| "its audit token is too short to name a pid".to_owned())?;
     Ok(i32::from_ne_bytes([word[0], word[1], word[2], word[3]]))
 }
 
 /// The signature of the code behind a local socket's peer, if it meets `requirement`.
 #[cfg(target_os = "macos")]
-pub fn signature_of_peer(
-    socket: std::os::fd::BorrowedFd<'_>,
-    requirement: &str,
-) -> Result<Signature, String> {
+pub fn signature_of_peer(socket: std::os::fd::BorrowedFd<'_>, requirement: &str) -> Result<Signature, String> {
     macos::check(&macos::guest_by_audit(&audit_token(socket)?)?, requirement)
 }
 
@@ -370,11 +307,7 @@ pub enum Trusted {
     /// what is the caller's to say: [`TrustTable::admits`]'s `owner`).
     Anemnez { team: String },
     /// One other team's process, scoped to exactly one segment. Added by a person, never by code.
-    Scoped {
-        team: String,
-        identifier: String,
-        segment: String,
-    },
+    Scoped { team: String, identifier: String, segment: String },
 }
 
 /// Who a host trusts, and with what: data a person can change, never a constant in a decision.
@@ -394,9 +327,7 @@ impl TrustTable {
     /// The default data: the Anemnez rule for `team` and nothing else (the User's interim policy, 2026-11-05:
     /// Anemnez-managed apps only). Where the team comes from (a host's trust policy) is the caller's.
     pub fn anemnez(team: &str) -> Self {
-        Self::new(vec![Trusted::Anemnez {
-            team: team.to_owned(),
-        }])
+        Self::new(vec![Trusted::Anemnez { team: team.to_owned() }])
     }
 
     pub fn entries(&self) -> &[Trusted] {
@@ -409,9 +340,7 @@ impl TrustTable {
 
     /// Whether `who` is under the Anemnez rule here (its team has an [`Trusted::Anemnez`] row).
     pub fn is_anemnez(&self, who: &Identity) -> bool {
-        self.entries
-            .iter()
-            .any(|t| matches!(t, Trusted::Anemnez { team } if *team == who.team))
+        self.entries.iter().any(|t| matches!(t, Trusted::Anemnez { team } if *team == who.team))
     }
 
     /// Whether `who` may write `segment`, whose owner under the Anemnez rule is the product `owner` (None
@@ -433,12 +362,10 @@ impl TrustTable {
         }
         match owner {
             Some(product) if identifier.strip_prefix(ANEMNEZ_PREFIX) == Some(product) => Ok(()),
-            Some(product) => Err(format!(
-                "'{segment}' belongs to {product} ({ANEMNEZ_PREFIX}{product}), not {identifier}"
-            )),
-            None => Err(format!(
-                "no product here owns '{segment}', so {identifier} may not write it"
-            )),
+            Some(product) => {
+                Err(format!("'{segment}' belongs to {product} ({ANEMNEZ_PREFIX}{product}), not {identifier}"))
+            }
+            None => Err(format!("no product here owns '{segment}', so {identifier} may not write it")),
         }
     }
 }
@@ -451,18 +378,13 @@ mod macos {
     use core_foundation::number::CFNumber;
     use core_foundation::string::CFString;
     use security_framework_sys::code_signing::{
-        SecCodeCheckValidity, SecCodeCopyGuestWithAttributes, SecCodeRef,
-        SecRequirementCreateWithString, SecRequirementRef, kSecCSStrictValidate,
-        kSecGuestAttributeAudit,
+        SecCodeCheckValidity, SecCodeCopyGuestWithAttributes, SecCodeRef, SecRequirementCreateWithString,
+        SecRequirementRef, kSecCSStrictValidate, kSecGuestAttributeAudit,
     };
 
     // Security.framework, not in security-framework-sys: the signing information of a (running) code.
     unsafe extern "C" {
-        fn SecCodeCopySigningInformation(
-            code: CFTypeRef,
-            flags: u32,
-            information: *mut CFDictionaryRef,
-        ) -> i32;
+        fn SecCodeCopySigningInformation(code: CFTypeRef, flags: u32, information: *mut CFDictionaryRef) -> i32;
     }
     /// kSecCSSigningInformation | kSecCSRequirementInformation | kSecCSDynamicInformation.
     const INFORMATION: u32 = (1 << 1) | (1 << 2) | (1 << 3);
@@ -481,18 +403,10 @@ mod macos {
         let attrs = CFDictionary::from_CFType_pairs(&[(attribute.as_CFType(), value)]);
         let mut code: SecCodeRef = std::ptr::null_mut();
         // SAFETY: a null host (the system) and a well-formed attribute dictionary; `code` is +1 on success.
-        let status = unsafe {
-            SecCodeCopyGuestWithAttributes(
-                std::ptr::null_mut(),
-                attrs.as_concrete_TypeRef(),
-                0,
-                &mut code,
-            )
-        };
+        let status =
+            unsafe { SecCodeCopyGuestWithAttributes(std::ptr::null_mut(), attrs.as_concrete_TypeRef(), 0, &mut code) };
         if status != 0 || code.is_null() {
-            return Err(format!(
-                "its running code cannot be found (OSStatus {status})"
-            ));
+            return Err(format!("its running code cannot be found (OSStatus {status})"));
         }
         Ok(Code(code))
     }
@@ -503,9 +417,7 @@ mod macos {
         // SAFETY: default flags; `code` is +1 on success.
         let status = unsafe { security_framework_sys::code_signing::SecCodeCopySelf(0, &mut code) };
         if status != 0 || code.is_null() {
-            return Err(format!(
-                "its own running code cannot be found (OSStatus {status})"
-            ));
+            return Err(format!("its own running code cannot be found (OSStatus {status})"));
         }
         Ok(Code(code))
     }
@@ -532,40 +444,27 @@ mod macos {
         let mut req: SecRequirementRef = std::ptr::null_mut();
         let text = CFString::new(requirement);
         // SAFETY: a well-formed requirement string; `req` is +1 on success.
-        let status =
-            unsafe { SecRequirementCreateWithString(text.as_concrete_TypeRef(), 0, &mut req) };
+        let status = unsafe { SecRequirementCreateWithString(text.as_concrete_TypeRef(), 0, &mut req) };
         if status != 0 || req.is_null() {
-            return Err(format!(
-                "the requirement does not parse (OSStatus {status})"
-            ));
+            return Err(format!("the requirement does not parse (OSStatus {status})"));
         }
         // SAFETY: both refs are valid.
         let status = unsafe { SecCodeCheckValidity(code.0, kSecCSStrictValidate, req) };
         // SAFETY: ours (+1), released once.
         unsafe { CFRelease(req.cast()) };
         if status != 0 {
-            return Err(format!(
-                "its code is not Apple-anchored and strictly valid (OSStatus {status})"
-            ));
+            return Err(format!("its code is not Apple-anchored and strictly valid (OSStatus {status})"));
         }
         let mut info: CFDictionaryRef = std::ptr::null();
         // SAFETY: a valid code ref (a SecCode is accepted where a SecStaticCode is); `info` is +1 on success.
-        let status =
-            unsafe { SecCodeCopySigningInformation(code.0.cast(), INFORMATION, &mut info) };
+        let status = unsafe { SecCodeCopySigningInformation(code.0.cast(), INFORMATION, &mut info) };
         if status != 0 || info.is_null() {
-            return Err(format!(
-                "its signing information cannot be read (OSStatus {status})"
-            ));
+            return Err(format!("its signing information cannot be read (OSStatus {status})"));
         }
         // SAFETY: a +1 dictionary, owned from here.
-        let info: CFDictionary<CFString, CFType> =
-            unsafe { CFDictionary::wrap_under_create_rule(info) };
+        let info: CFDictionary<CFString, CFType> = unsafe { CFDictionary::wrap_under_create_rule(info) };
         let get = |key: &str| info.find(CFString::new(key)).map(|v| v.clone());
-        let text = |key: &str| {
-            get(key)
-                .and_then(|v| v.downcast::<CFString>())
-                .map(|s| s.to_string())
-        };
+        let text = |key: &str| get(key).and_then(|v| v.downcast::<CFString>()).map(|s| s.to_string());
         let identifier = text("identifier").ok_or("its signature names no identifier")?;
         let team = text("teamid").ok_or("its signature names no team")?;
         let flags = get("flags")
@@ -583,12 +482,7 @@ mod macos {
                     .collect()
             })
             .unwrap_or_default();
-        Ok(super::Signature {
-            team,
-            identifier,
-            flags,
-            entitlements,
-        })
+        Ok(super::Signature { team, identifier, flags, entitlements })
     }
 }
 
@@ -600,18 +494,11 @@ mod tests {
     #[test]
     fn a_process_is_checked_once_and_only_lasting_verdicts_are_kept() {
         use std::cell::Cell;
-        let v = super::Verdicts::new(
-            std::time::Duration::from_secs(600),
-            std::time::Duration::from_secs(60),
-            2,
-        );
+        let v = super::Verdicts::new(std::time::Duration::from_secs(600), std::time::Duration::from_secs(60), 2);
         let runs = Cell::new(0);
         let ok = || {
             runs.set(runs.get() + 1);
-            Ok(super::Identity {
-                team: "TEAM".into(),
-                identifier: "ai.anemnez.x".into(),
-            })
+            Ok(super::Identity { team: "TEAM".into(), identifier: "ai.anemnez.x".into() })
         };
         assert!(v.get_or_check(b"tok-a", ok).is_ok());
         assert!(v.get_or_check(b"tok-a", ok).is_ok());
@@ -636,21 +523,13 @@ mod tests {
         let _ = stale.get_or_check(b"tok-d", ok);
         assert_eq!(runs.get(), 6, "a stale verdict is checked again");
         // D, 2026-11-06: a refusal clears sooner than a verified identity (a binary mid-swap).
-        let short = super::Verdicts::new(
-            std::time::Duration::from_secs(600),
-            std::time::Duration::ZERO,
-            8,
-        );
+        let short = super::Verdicts::new(std::time::Duration::from_secs(600), std::time::Duration::ZERO, 8);
         let _ = short.get_or_check(b"tok-e", ok);
         let _ = short.get_or_check(b"tok-e", ok);
         assert_eq!(runs.get(), 7, "verified: still held");
         let _ = short.get_or_check(b"tok-f", refused);
         let _ = short.get_or_check(b"tok-f", refused);
-        assert_eq!(
-            runs.get(),
-            9,
-            "refused: re-checked once its shorter time is up"
-        );
+        assert_eq!(runs.get(), 9, "refused: re-checked once its shorter time is up");
     }
 
     use super::*;
@@ -667,10 +546,7 @@ mod tests {
     }
 
     fn id(team: &str, identifier: &str) -> Identity {
-        Identity {
-            team: team.into(),
-            identifier: identifier.into(),
-        }
+        Identity { team: team.into(), identifier: identifier.into() }
     }
 
     /// Only an untamperable signature is an identity: the hardened runtime, and none of the three
@@ -678,29 +554,13 @@ mod tests {
     #[test]
     fn only_a_hardened_untamperable_signature_is_an_identity() {
         let herald = id(TEAM, "ai.anemnez.herald");
-        assert_eq!(
-            judge(signature("ai.anemnez.herald", HARDENED_RUNTIME, &[])),
-            Ok(herald.clone())
-        );
-        assert!(
-            judge(signature("ai.anemnez.herald", 0, &[]))
-                .expect_err("soft")
-                .contains("hardened runtime")
-        );
+        assert_eq!(judge(signature("ai.anemnez.herald", HARDENED_RUNTIME, &[])), Ok(herald.clone()));
+        assert!(judge(signature("ai.anemnez.herald", 0, &[])).expect_err("soft").contains("hardened runtime"));
         for entitlement in TAMPERING {
-            let open = judge(signature(
-                "ai.anemnez.herald",
-                HARDENED_RUNTIME,
-                &[entitlement],
-            ))
-            .expect_err("open");
+            let open = judge(signature("ai.anemnez.herald", HARDENED_RUNTIME, &[entitlement])).expect_err("open");
             assert!(open.contains(entitlement), "{open}");
         }
-        let harmless = signature(
-            "ai.anemnez.herald",
-            HARDENED_RUNTIME,
-            &["com.apple.security.network.client"],
-        );
+        let harmless = signature("ai.anemnez.herald", HARDENED_RUNTIME, &["com.apple.security.network.client"]);
         assert_eq!(judge(harmless), Ok(herald));
     }
 
@@ -718,24 +578,13 @@ mod tests {
                 .expect_err("foreign")
                 .contains("belongs to artichoke")
         );
-        assert!(
-            table
-                .admits(&herald, "nobody", None)
-                .expect_err("unowned")
-                .contains("no product here owns")
-        );
+        assert!(table.admits(&herald, "nobody", None).expect_err("unowned").contains("no product here owns"));
         let posing = id("ABCDE12345", "ai.anemnez.herald");
         assert!(
-            table
-                .admits(&posing, "herald", Some("herald"))
-                .expect_err("posing")
-                .contains("no team this host trusts")
+            table.admits(&posing, "herald", Some("herald")).expect_err("posing").contains("no team this host trusts")
         );
         let theirs = id("ABCDE12345", "com.example.telegram");
-        assert!(
-            table.admits(&theirs, "telegram", None).is_err(),
-            "read-only by default"
-        );
+        assert!(table.admits(&theirs, "telegram", None).is_err(), "read-only by default");
         let mut entries = table.entries().to_vec();
         entries.push(Trusted::Scoped {
             team: "ABCDE12345".into(),
@@ -744,15 +593,10 @@ mod tests {
         });
         let scoped = TrustTable::new(entries);
         assert_eq!(scoped.admits(&theirs, "telegram", None), Ok(()));
-        assert!(
-            scoped.admits(&theirs, "herald", Some("herald")).is_err(),
-            "only its one segment"
-        );
+        assert!(scoped.admits(&theirs, "herald", Some("herald")).is_err(), "only its one segment");
         assert!(!scoped.is_anemnez(&theirs) && scoped.is_anemnez(&herald));
         assert!(
-            TrustTable::default()
-                .admits(&herald, "herald", Some("herald"))
-                .is_err(),
+            TrustTable::default().admits(&herald, "herald", Some("herald")).is_err(),
             "an empty table admits nobody"
         );
     }
@@ -763,25 +607,15 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_running_codes_signature_is_read_only_after_it_is_validated() {
-        let mut child = std::process::Command::new("/bin/sleep")
-            .arg("5")
-            .spawn()
-            .expect("sleep");
+        let mut child = std::process::Command::new("/bin/sleep").arg("5").spawn().expect("sleep");
         let pid = i32::try_from(child.id()).expect("pid");
         let code = macos::guest_by_pid(pid).expect("its code");
         let anchored = macos::check(&code, APPLE_ANCHORED);
         let unmet = macos::check(&code, "identifier \"ai.anemnez.herald\"");
         drop(child.kill());
         drop(child.wait());
-        assert!(
-            anchored.expect_err("no team").contains("names no team"),
-            "validated, then read"
-        );
-        assert!(
-            unmet
-                .expect_err("unmet")
-                .contains("not Apple-anchored and strictly valid")
-        );
+        assert!(anchored.expect_err("no team").contains("names no team"), "validated, then read");
+        assert!(unmet.expect_err("unmet").contains("not Apple-anchored and strictly valid"));
     }
 
     /// `own()` reads this process's own code through the same strict check: the test binary is linker-signed
@@ -802,10 +636,7 @@ mod tests {
         let (ours, _theirs) = std::os::unix::net::UnixStream::pair().expect("a pair");
         let token = audit_token(ours.as_fd()).expect("a connected socket has a peer token");
         assert_eq!(token.len(), 32, "an audit_token_t is eight u32s");
-        assert_eq!(
-            peer_pid(ours.as_fd()),
-            Ok(i32::try_from(std::process::id()).unwrap())
-        );
+        assert_eq!(peer_pid(ours.as_fd()), Ok(i32::try_from(std::process::id()).unwrap()));
     }
 
     /// A connection's peer, judged, is exactly the process using it: here this process, now, and its
@@ -870,9 +701,6 @@ mod tests {
         use std::os::fd::AsFd;
         let (ours, _theirs) = std::os::unix::net::UnixStream::pair().expect("a pair");
         let found = of_peer(ours.as_fd()).expect_err("an ad hoc test binary");
-        assert!(
-            found.contains("not Apple-anchored"),
-            "the token was read and the code checked: {found}"
-        );
+        assert!(found.contains("not Apple-anchored"), "the token was read and the code checked: {found}");
     }
 }

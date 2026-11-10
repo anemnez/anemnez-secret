@@ -29,15 +29,8 @@ fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
         k[..key.len()].copy_from_slice(key);
     }
     let pad = |byte: u8| k.map(|b| b ^ byte);
-    let inner = Sha256::new()
-        .chain_update(pad(0x36))
-        .chain_update(message)
-        .finalize();
-    Sha256::new()
-        .chain_update(pad(0x5c))
-        .chain_update(inner)
-        .finalize()
-        .into()
+    let inner = Sha256::new().chain_update(pad(0x36)).chain_update(message).finalize();
+    Sha256::new().chain_update(pad(0x5c)).chain_update(inner).finalize().into()
 }
 
 /// Whether `got` is the expected proof, compared in constant time; a proof of another length is refused.
@@ -45,11 +38,7 @@ pub fn verify(expected: &Witness, got: &[u8]) -> bool {
     if got.len() != expected.len() {
         return false;
     }
-    expected
-        .iter()
-        .zip(got)
-        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-        == 0
+    expected.iter().zip(got).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
 }
 
 /// The proof of `value` under `nonce`.
@@ -79,11 +68,7 @@ pub trait Successor {
 
 /// The old build's side: hand `item`'s value to `successor`, removing the original only after the
 /// successor has proved it holds the same value. Run again after a cut, it finishes.
-pub fn hand_off(
-    keychain: &Keychain,
-    item: &Item,
-    successor: &mut dyn Successor,
-) -> Result<(), String> {
+pub fn hand_off(keychain: &Keychain, item: &Item, successor: &mut dyn Successor) -> Result<(), String> {
     match keychain.get(item) {
         Ok(value) => {
             let nonce = nonce()?;
@@ -125,18 +110,11 @@ pub fn receive(
 pub fn finish(keychain: &Keychain, item: &Item, made_by: &str) -> Result<(), String> {
     let next = item.next();
     match (keychain.get(item), keychain.get(&next)) {
-        (Err(CustodyError::NotHeld(_)), Ok(_)) => keychain
-            .rename(&next, item, made_by)
-            .map_err(|e| e.to_string()),
+        (Err(CustodyError::NotHeld(_)), Ok(_)) => keychain.rename(&next, item, made_by).map_err(|e| e.to_string()),
         (Ok(_), Err(CustodyError::NotHeld(_))) => Ok(()),
         // A rename cut short after its write: both hold the same value, so .next goes.
-        (Ok(a), Ok(b)) if a.expose(|x| b.expose(|y| x == y)) => {
-            keychain.remove(&next).map_err(|e| e.to_string())
-        }
-        (Ok(_), Ok(_)) => Err(format!(
-            "{item} and {} hold different values; nothing is changed",
-            next
-        )),
+        (Ok(a), Ok(b)) if a.expose(|x| b.expose(|y| x == y)) => keychain.remove(&next).map_err(|e| e.to_string()),
+        (Ok(_), Ok(_)) => Err(format!("{item} and {} hold different values; nothing is changed", next)),
         (Err(CustodyError::NotHeld(_)), Err(CustodyError::NotHeld(_))) => {
             Err(format!("neither {item} nor {next} is held"))
         }
@@ -158,8 +136,8 @@ mod tests {
 
     fn keychain() -> (tempfile::TempDir, Keychain) {
         let dir = tempfile::tempdir().expect("scratch");
-        let k = Keychain::create_at(&dir.path().join("proof.keychain-db"), "proof-only")
-            .expect("a keychain of its own");
+        let k =
+            Keychain::create_at(&dir.path().join("proof.keychain-db"), "proof-only").expect("a keychain of its own");
         (dir, k)
     }
 
@@ -178,12 +156,7 @@ mod tests {
             if self.short {
                 return Ok(w[..16].to_vec());
             }
-            Ok(if self.lie {
-                witness(&Secret::new(b"another".to_vec()), nonce)
-            } else {
-                w
-            }
-            .to_vec())
+            Ok(if self.lie { witness(&Secret::new(b"another".to_vec()), nonce) } else { w }.to_vec())
         }
         fn finish(&mut self) -> Result<(), String> {
             if self.cut {
@@ -204,50 +177,21 @@ mod tests {
     fn a_hand_off_moves_the_value_and_finishes_after_a_cut() {
         let (_dir, k) = keychain();
         let item = Item::new("ai.anemnez.example.role", "promoter@node");
-        k.add(
-            &item,
-            &Secret::new(VALUE.into()),
-            "identifier \"ai.anemnez.example\"",
-        )
-        .unwrap();
-        assert_eq!(
-            k.maker(&item).as_deref(),
-            Some("identifier \"ai.anemnez.example\""),
-            "made by, without the value"
-        );
+        k.add(&item, &Secret::new(VALUE.into()), "identifier \"ai.anemnez.example\"").unwrap();
+        assert_eq!(k.maker(&item).as_deref(), Some("identifier \"ai.anemnez.example\""), "made by, without the value");
 
-        let mut cut = Local {
-            keychain: &k,
-            item: item.clone(),
-            cut: true,
-            lie: false,
-            short: false,
-        };
+        let mut cut = Local { keychain: &k, item: item.clone(), cut: true, lie: false, short: false };
+        assert!(hand_off(&k, &item, &mut cut).is_err(), "cut short after the original went");
         assert!(
-            hand_off(&k, &item, &mut cut).is_err(),
-            "cut short after the original went"
-        );
-        assert!(
-            held(&k, &item).is_none()
-                && held(&k, &item.next()).as_deref() == Some(VALUE.as_bytes()),
+            held(&k, &item).is_none() && held(&k, &item.next()).as_deref() == Some(VALUE.as_bytes()),
             ".next holds it"
         );
 
-        let mut again = Local {
-            keychain: &k,
-            item: item.clone(),
-            cut: false,
-            lie: false,
-            short: false,
-        };
+        let mut again = Local { keychain: &k, item: item.clone(), cut: false, lie: false, short: false };
         hand_off(&k, &item, &mut again).expect("run again, it finishes");
         assert_eq!(held(&k, &item).as_deref(), Some(VALUE.as_bytes()));
         assert!(held(&k, &item.next()).is_none(), "no .next left");
-        assert_eq!(
-            k.maker(&item).as_deref(),
-            Some(NEW),
-            "the item is the new build's now"
-        );
+        assert_eq!(k.maker(&item).as_deref(), Some(NEW), "the item is the new build's now");
         hand_off(&k, &item, &mut again).expect("and again: idempotent");
         assert_eq!(held(&k, &item).as_deref(), Some(VALUE.as_bytes()));
     }
@@ -258,27 +202,11 @@ mod tests {
         let (_dir, k) = keychain();
         let item = Item::new("ai.anemnez.example.role", "short@node");
         k.add(&item, &Secret::new(VALUE.into()), "old").unwrap();
-        let mut short = Local {
-            keychain: &k,
-            item: item.clone(),
-            cut: false,
-            lie: false,
-            short: true,
-        };
-        assert!(
-            hand_off(&k, &item, &mut short)
-                .unwrap_err()
-                .contains("left as it is")
-        );
-        assert_eq!(
-            held(&k, &item).as_deref(),
-            Some(VALUE.as_bytes()),
-            "the original stays"
-        );
+        let mut short = Local { keychain: &k, item: item.clone(), cut: false, lie: false, short: true };
+        assert!(hand_off(&k, &item, &mut short).unwrap_err().contains("left as it is"));
+        assert_eq!(held(&k, &item).as_deref(), Some(VALUE.as_bytes()), "the original stays");
         let w = witness(&Secret::new(VALUE.into()), &[7u8; 32]);
-        assert!(
-            super::verify(&w, &w) && !super::verify(&w, &w[..31]) && !super::verify(&w, &[0u8; 33])
-        );
+        assert!(super::verify(&w, &w) && !super::verify(&w, &w[..31]) && !super::verify(&w, &[0u8; 33]));
     }
 
     /// A successor that cannot prove it holds the same value never gets the original removed.
@@ -287,21 +215,11 @@ mod tests {
         let (_dir, k) = keychain();
         let item = Item::new("ai.anemnez.example.role", "feed@node");
         k.add(&item, &Secret::new(VALUE.into()), "old").unwrap();
-        let mut liar = Local {
-            keychain: &k,
-            item: item.clone(),
-            cut: false,
-            lie: true,
-            short: false,
-        };
+        let mut liar = Local { keychain: &k, item: item.clone(), cut: false, lie: true, short: false };
         let refused = hand_off(&k, &item, &mut liar).unwrap_err();
         assert!(refused.contains("left as it is"), "{refused}");
         assert!(!refused.contains("ZZZtop"), "{refused}");
-        assert_eq!(
-            held(&k, &item).as_deref(),
-            Some(VALUE.as_bytes()),
-            "the original stays"
-        );
+        assert_eq!(held(&k, &item).as_deref(), Some(VALUE.as_bytes()), "the original stays");
     }
 
     /// finish() is safe at every state it can find: both held and equal (a rename cut after its write)
@@ -311,22 +229,12 @@ mod tests {
         let (_dir, k) = keychain();
         let item = Item::new("ai.anemnez.example.role", "x");
         k.add(&item, &Secret::new(VALUE.into()), "old").unwrap();
-        k.add(&item.next(), &Secret::new(VALUE.into()), NEW)
-            .unwrap();
+        k.add(&item.next(), &Secret::new(VALUE.into()), NEW).unwrap();
         finish(&k, &item, NEW).expect("equal: .next goes");
         assert!(held(&k, &item.next()).is_none());
-        k.add(&item.next(), &Secret::new(b"different".to_vec()), NEW)
-            .unwrap();
-        assert!(
-            finish(&k, &item, NEW)
-                .unwrap_err()
-                .contains("different values")
-        );
-        assert_eq!(
-            held(&k, &item).as_deref(),
-            Some(VALUE.as_bytes()),
-            "nothing changed"
-        );
+        k.add(&item.next(), &Secret::new(b"different".to_vec()), NEW).unwrap();
+        assert!(finish(&k, &item, NEW).unwrap_err().contains("different values"));
+        assert_eq!(held(&k, &item).as_deref(), Some(VALUE.as_bytes()), "nothing changed");
         assert!(matches!(
             k.add(&item, &Secret::new(b"over".to_vec()), NEW),
             Err(crate::custody::CustodyError::Exists(_))
@@ -340,10 +248,7 @@ mod tests {
     fn hmac_sha256_meets_rfc_4231() {
         let mac = super::hmac_sha256(b"Jefe", b"what do ya want for nothing?");
         let hex: String = mac.iter().map(|b| format!("{b:02x}")).collect();
-        assert_eq!(
-            hex,
-            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
-        );
+        assert_eq!(hex, "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
     }
 
     #[test]
@@ -351,14 +256,7 @@ mod tests {
         let v = Secret::new(VALUE.into());
         let (a, b) = ([1u8; 32], [2u8; 32]);
         assert_eq!(witness(&v, &a), witness(&Secret::new(VALUE.into()), &a));
-        assert_ne!(
-            witness(&v, &a),
-            witness(&v, &b),
-            "a fresh nonce, a fresh proof"
-        );
-        assert_ne!(
-            witness(&v, &a),
-            witness(&Secret::new(b"other".to_vec()), &a)
-        );
+        assert_ne!(witness(&v, &a), witness(&v, &b), "a fresh nonce, a fresh proof");
+        assert_ne!(witness(&v, &a), witness(&Secret::new(b"other".to_vec()), &a));
     }
 }

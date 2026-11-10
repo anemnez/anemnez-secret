@@ -23,7 +23,6 @@
 # refusal to green-wash) while it writes the floors; the run after it is the green ratchet.
 [run]
 proofs   = ["proofs"]           # directory-name patterns; your proof suites live in the open
-config   = ".prova/config.lua"  # the runtime companion — where capabilities are registered
 packages = ".prova/packages"    # this project's own packages; `require("<dir>")` reaches each one
 
 # The cargo-based quality gates (clippy, the unwrap/expect census, duplication, file sizes under
@@ -78,6 +77,9 @@ must_run    = ["cargo-nextest"]
 # "we answered everything" reading identically to "we could not ask anything".
 [profiles.ci]
 must_run = ["cargo"]
+
+[dependencies]
+project-standards = { git = "ssh://git@github.com/anemnez/prova-project-standards.git", tag = "v2" }
 
 # Declare the prova this suite needs, and an older binary says so up front instead of failing
 # mid-run on a feature it does not have. Write `>=`: the value is a semver RANGE, so a bare

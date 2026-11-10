@@ -58,22 +58,12 @@ mod tests {
     fn a_secret_printed_any_way_says_nothing() {
         let value = "github_pat_11AAAAA0123456789abcdefSECRET";
         let secret = Secret::new(value.as_bytes().to_vec());
-        for printed in [
-            format!("{secret}"),
-            format!("{secret:?}"),
-            format!("{secret:#?}"),
-            format!("{:?}", Some(&secret)),
-        ] {
-            assert!(
-                !printed.contains("SECRET") && !printed.contains("github_pat_"),
-                "{printed}"
-            );
+        for printed in
+            [format!("{secret}"), format!("{secret:?}"), format!("{secret:#?}"), format!("{:?}", Some(&secret))]
+        {
+            assert!(!printed.contains("SECRET") && !printed.contains("github_pat_"), "{printed}");
             assert!(printed.contains(REDACTED), "{printed}");
         }
-        assert_eq!(
-            secret.expose(|v| v.to_vec()),
-            value.as_bytes(),
-            "the edge still gets the value"
-        );
+        assert_eq!(secret.expose(|v| v.to_vec()), value.as_bytes(), "the edge still gets the value");
     }
 }
