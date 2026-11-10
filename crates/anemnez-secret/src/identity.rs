@@ -354,6 +354,148 @@ pub fn peer_pid(socket: std::os::fd::BorrowedFd<'_>) -> Result<i32, String> {
     Ok(i32::from_ne_bytes([word[0], word[1], word[2], word[3]]))
 }
 
+/// One process as the kernel names it: its pid, its unique id (never reused while the machine is up), its
+/// parent's unique id AS THE KERNEL RECORDED IT at fork (`p_puniqueid`), and its pidversion (which an
+/// exec changes). The one home for reading a process and its tree (D's census, m/6308; moved from Agora).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Process {
+    pub pid: i32,
+    pub unique_id: u64,
+    pub parent_unique_id: u64,
+    pub pidversion: i32,
+}
+
+/// The live process with `pid`, read now, if any.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn process(pid: i32) -> Option<Process> {
+    /// `PROC_PIDUNIQIDENTIFIERINFO` (sys/proc_info.h), which libc does not carry.
+    const PROC_PIDUNIQIDENTIFIERINFO: libc::c_int = 17;
+    /// `struct proc_uniqidentifierinfo` (sys/proc_info.h).
+    #[repr(C)]
+    #[derive(Default)]
+    struct UniqIdentifierInfo {
+        uuid: [u8; 16],
+        unique_id: u64,
+        parent_unique_id: u64,
+        pidversion: i32,
+        reserve2: u32,
+        reserve3: u64,
+        reserve4: u64,
+    }
+    let mut info = UniqIdentifierInfo::default();
+    let size = std::mem::size_of::<UniqIdentifierInfo>() as libc::c_int;
+    // SAFETY: `info` is a plain repr(C) struct of `size` bytes that proc_pidinfo writes at most `size`
+    // bytes into; it reads nothing of ours.
+    let n = unsafe { libc::proc_pidinfo(pid, PROC_PIDUNIQIDENTIFIERINFO, 0, (&raw mut info).cast(), size) };
+    (n == size).then_some(Process {
+        pid,
+        unique_id: info.unique_id,
+        parent_unique_id: info.parent_unique_id,
+        pidversion: info.pidversion,
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+#[must_use]
+pub fn process(_pid: i32) -> Option<Process> {
+    None
+}
+
+/// The live process whose unique id is `unique_id`, if any: a scan of every pid, so for a lookup a
+/// caller can't make by pid (a parent named only by its recorded unique id).
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn process_by_unique_id(unique_id: u64) -> Option<Process> {
+    // SAFETY: a null buffer asks only for the size needed.
+    let need = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+    if need <= 0 {
+        return None;
+    }
+    let mut pids = vec![0i32; need as usize + 64];
+    let bytes = (pids.len() * std::mem::size_of::<i32>()) as libc::c_int;
+    // SAFETY: `pids` has room for `bytes` bytes, which proc_listallpids writes at most.
+    let n = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+    pids.truncate(n.max(0) as usize);
+    pids.into_iter().filter_map(process).find(|p| p.unique_id == unique_id)
+}
+
+#[cfg(not(target_os = "macos"))]
+#[must_use]
+pub fn process_by_unique_id(_unique_id: u64) -> Option<Process> {
+    None
+}
+
+/// How far up a chain of ancestors a walk goes before it stops believing it.
+const MAX_DEPTH: usize = 128;
+
+/// `pid` and its ancestors, by unique id, nearest first. Each link is believed only when the process at
+/// the parent's pid is the parent the kernel RECORDED for the child (`p_puniqueid`), so a pid reused
+/// after a parent exited never joins the tree; the walk stops there, or at launchd. Empty when `pid`
+/// names no process.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn tree_of(pid: i32) -> Vec<u64> {
+    let Some(mut child) = process(pid) else { return Vec::new() };
+    let mut tree = vec![child.unique_id];
+    for _ in 0..MAX_DEPTH {
+        let Some(up) = parent_pid(child.pid).filter(|&up| up > 1) else { break };
+        match process(up) {
+            Some(parent) if parent.unique_id == child.parent_unique_id => {
+                tree.push(parent.unique_id);
+                child = parent;
+            }
+            _ => break,
+        }
+    }
+    tree
+}
+
+#[cfg(not(target_os = "macos"))]
+#[must_use]
+pub fn tree_of(_pid: i32) -> Vec<u64> {
+    Vec::new()
+}
+
+/// The parent pid the kernel holds for `pid` now (`pbi_ppid`).
+#[cfg(target_os = "macos")]
+fn parent_pid(pid: i32) -> Option<i32> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: the kernel writes at most `size` bytes of a proc_bsdinfo into `info`.
+    let n = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, info.as_mut_ptr().cast(), size) };
+    // SAFETY: the kernel filled all `size` bytes, and proc_bsdinfo is plain data (zeroed is valid too).
+    (n == size).then(|| unsafe { info.assume_init() }.pbi_ppid as i32)
+}
+
+/// The process at the other end of a local `socket` and its ancestors, by unique id, nearest first
+/// ([`tree_of`] from the peer's pid). The FIRST link is weaker than the rest, a stated limit (D, H,
+/// 2026-11-09): it is whoever holds, now, the pid that last used the socket (`LOCAL_PEERPID`), which
+/// the audit token can't pin (see [`audit_token_words`]), so a process that handed its socket on and
+/// exited, its pid reused, starts the tree at the reuser. From the second link up, a reused pid never
+/// joins. Read while the peer holds the connection open; empty when the socket names no peer.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn tree_of_peer(socket: std::os::fd::BorrowedFd<'_>) -> Vec<u64> {
+    use std::os::fd::AsRawFd;
+    let mut pid: libc::pid_t = 0;
+    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    // SAFETY: a pid_t-sized out-buffer with its length, on a descriptor the caller holds open.
+    let rc = unsafe {
+        libc::getsockopt(socket.as_raw_fd(), libc::SOL_LOCAL, libc::LOCAL_PEERPID, (&raw mut pid).cast(), &mut len)
+    };
+    if rc != 0 || pid <= 0 {
+        return Vec::new();
+    }
+    tree_of(pid)
+}
+
+#[cfg(not(target_os = "macos"))]
+#[must_use]
+pub fn tree_of_peer(_socket: std::os::fd::BorrowedFd<'_>) -> Vec<u64> {
+    Vec::new()
+}
+
 /// The signature of the code behind a local socket's peer, if it meets `requirement`.
 #[cfg(target_os = "macos")]
 pub fn signature_of_peer(
@@ -874,5 +1016,23 @@ mod tests {
             found.contains("not Apple-anchored"),
             "the token was read and the code checked: {found}"
         );
+    }
+
+    /// (D's census, m/6308) a process and its tree, read from the kernel: this test's own process by its
+    /// pid, then its parent as the kernel recorded it, and the same tree from the far end of a socket.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_process_and_its_tree_are_read_by_unique_id() {
+        use std::os::fd::AsFd;
+        let me = super::process(std::process::id() as i32).expect("this process");
+        assert_eq!(me.pid, std::process::id() as i32);
+        assert_ne!(me.unique_id, 0);
+        assert_eq!(super::process_by_unique_id(me.unique_id), Some(me), "found again by unique id");
+        let tree = super::tree_of(me.pid);
+        assert_eq!(tree.first(), Some(&me.unique_id), "{tree:?}");
+        assert_eq!(tree.get(1), Some(&me.parent_unique_id), "the parent the kernel recorded: {tree:?}");
+        let (a, _b) = std::os::unix::net::UnixStream::pair().expect("a pair");
+        assert_eq!(super::tree_of_peer(a.as_fd()), tree, "the peer of a pair is this process");
+        assert!(super::tree_of(-1).is_empty() && super::process(-1).is_none());
     }
 }

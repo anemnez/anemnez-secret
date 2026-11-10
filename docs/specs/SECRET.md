@@ -85,6 +85,11 @@ moved from fabric's step 0 `writers.rs`).
   through the owner check.
 - A verdict vouches for the process that connected, at connect, not for whoever later holds the socket,
   so a product never passes its connection on.
+- `identity::process(pid)` reads one process (pid, unique id, the parent's unique id as the kernel
+  recorded it at fork, pidversion), and `tree_of(pid)` / `tree_of_peer(socket)` its ancestors by unique
+  id, each link believed only when it is the recorded parent, so from the second link up a reused pid
+  never joins. The first link of `tree_of_peer` is whoever holds the socket's peer pid now, a stated
+  limit. The one home for a process tree (D's census; moved from Agora's place.rs).
 
 ## 4. The owner is proven, never assumed
 
