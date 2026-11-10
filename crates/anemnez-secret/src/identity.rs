@@ -20,7 +20,9 @@
 //! pid or an exec'd process never meets a stale verdict. Only lasting answers are cached (a verified
 //! identity, or a refusal the signature itself gives), never a transient failure.
 //!
-//! A verdict vouches for the process that CONNECTED, at connect, not for whoever later holds the socket.
+//! A verdict vouches for the process the audit token named when it was read (a live read of whoever
+//! holds the socket's peer pid then, not a record of the connector: [`audit_token_words`]), not for
+//! whoever later holds the socket.
 //! A verified process that passes its connection on (`SCM_RIGHTS`, or an fd inherited without CLOEXEC;
 //! std and tokio sockets are CLOEXEC) lends its identity to the receiver, so a product never passes its
 //! connection on.
@@ -216,21 +218,29 @@ pub fn of_peer_cached(
     })
 }
 
-/// A local socket's peer's audit token, as the kernel recorded it at connect: an `audit_token_t`.
-/// Public so a daemon can hand it to Agora's `WhoIs` (agora-client), which names a process by this
-/// token and never by a pid (LADON.md §5b). Cheap: one getsockopt, no signature check.
+/// A local socket's peer's whole audit token (`audit_token_t`'s eight words: auid, euid, egid, ruid,
+/// rgid, pid, asid, pidversion): the ONE `LOCAL_PEERTOKEN` read every product calls (anemnez-service
+/// docs/specs/SHARED.md; anemnez-service `product::peer` re-exports it). Cheap: one getsockopt, no
+/// signature check. A short answer is an error, never a zero-filled token.
+///
+/// It is a LIVE read, not a record made at connect (H, 2026-11-09, measured): the kernel builds it from
+/// whatever process holds the socket's peer pid NOW, the last process to use the socket. After the
+/// connector execs it names the new image (a new pidversion), and a forked child writing on an
+/// inherited connection can be the one named. Read it at accept and keep what you read. What it proves is
+/// "the process using this socket now, by its holder's choice" (agora AGORA.md
+/// #what-a-peers-audit-token-proves); nothing authorizes on it alone before the PROC_PIDFDSOCKETINFO
+/// socket match.
 #[cfg(target_os = "macos")]
-pub fn audit_token(socket: std::os::fd::BorrowedFd<'_>) -> Result<Vec<u8>, String> {
+pub fn audit_token_words(socket: std::os::fd::BorrowedFd<'_>) -> Result<[u32; 8], String> {
     use std::os::fd::AsRawFd;
-    // sys/un.h: SOL_LOCAL 0, LOCAL_PEERTOKEN 6, an audit_token_t of eight u32s.
-    let mut token = [0u8; 32];
-    let mut len = token.len() as libc::socklen_t;
-    // SAFETY: a valid socket fd, and a buffer of `len` bytes for getsockopt to fill.
+    let mut token = [0u32; 8];
+    let mut len = std::mem::size_of_val(&token) as libc::socklen_t;
+    // SAFETY: a valid socket fd, and a buffer of `len` bytes (an audit_token_t) for getsockopt to fill.
     let rc = unsafe {
         libc::getsockopt(
             socket.as_raw_fd(),
-            0,
-            6,
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERTOKEN,
             token.as_mut_ptr().cast(),
             &mut len,
         )
@@ -241,12 +251,100 @@ pub fn audit_token(socket: std::os::fd::BorrowedFd<'_>) -> Result<Vec<u8>, Strin
             std::io::Error::last_os_error()
         ));
     }
-    let len = usize::try_from(len).map_err(|e| e.to_string())?;
-    Ok(token[..len].to_vec())
+    if len as usize != std::mem::size_of_val(&token) {
+        return Err(format!(
+            "LOCAL_PEERTOKEN answered {len} bytes, not an audit token"
+        ));
+    }
+    Ok(token)
 }
 
-/// The pid in a local socket's peer's audit token (its sixth word), from the kernel at connect: which
-/// process connected, so a holder can require the one child it started (retrust).
+/// [`audit_token_words`] as the kernel's 32 bytes, for a daemon that hands its peer's token to Agora's
+/// `WhoIs` (agora-client), which names a process by this token and never by a pid (LADON.md §5b).
+#[cfg(target_os = "macos")]
+pub fn audit_token(socket: std::os::fd::BorrowedFd<'_>) -> Result<Vec<u8>, String> {
+    Ok(audit_token_words(socket)?
+        .iter()
+        .flat_map(|w| w.to_ne_bytes())
+        .collect())
+}
+
+/// A process, exactly: its pid and the version of that pid (a pid reused, or an exec, is another version).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Token {
+    pub pid: i32,
+    pub pidversion: i32,
+}
+
+#[cfg(target_os = "macos")]
+impl Token {
+    /// Whether this is the process that runs as `pid` now, as this process's own user (see [`current`]).
+    pub fn is(&self, pid: i32) -> bool {
+        current(pid).is_some_and(|now| now == *self)
+    }
+
+    /// The token's process, or None unless it runs as this process's effective user.
+    fn from_words(t: &[u32; 8]) -> Option<Self> {
+        // audit_token_to_euid, _pid and _pidversion (bsm/libbsm.h): words 1, 5 and 7.
+        // SAFETY: geteuid has no preconditions.
+        (t[1] == unsafe { libc::geteuid() }).then(|| Self {
+            pid: t[5] as i32,
+            pidversion: t[7] as i32,
+        })
+    }
+}
+
+/// The peer of `socket`, judged: the process holding its peer pid now (a live read, see
+/// [`audit_token_words`]), refused unless it runs as this process's effective user.
+#[cfg(target_os = "macos")]
+pub fn peer(socket: std::os::fd::BorrowedFd<'_>) -> Result<Token, String> {
+    Token::from_words(&audit_token_words(socket)?)
+        .ok_or_else(|| "the peer runs as another user".to_owned())
+}
+
+/// The process running as `pid` now, or `None` when there is none or it belongs to another user
+/// (`task_name_for_pid`, then `TASK_AUDIT_TOKEN`).
+#[cfg(target_os = "macos")]
+pub fn current(pid: i32) -> Option<Token> {
+    /// `TASK_AUDIT_TOKEN` and its count (mach/task_info.h); libc does not carry them.
+    const TASK_AUDIT_TOKEN: libc::c_uint = 15;
+    const TASK_AUDIT_TOKEN_COUNT: libc::mach_msg_type_number_t = 8;
+    unsafe extern "C" {
+        /// This task's own port: what the `mach_task_self()` macro reads.
+        static mach_task_self_: libc::mach_port_t;
+        fn task_name_for_pid(
+            target: libc::mach_port_t,
+            pid: libc::c_int,
+            name: *mut libc::mach_port_t,
+        ) -> libc::c_int;
+        fn mach_port_deallocate(task: libc::mach_port_t, name: libc::mach_port_t) -> libc::c_int;
+    }
+    let mut name: libc::mach_port_t = 0;
+    // SAFETY: plain mach calls on this task's own port; `name` is released below once it was granted.
+    unsafe {
+        let me = mach_task_self_;
+        if task_name_for_pid(me, pid, &mut name) != 0 {
+            return None;
+        }
+        let mut token = [0u32; 8];
+        let mut count = TASK_AUDIT_TOKEN_COUNT;
+        let rc = libc::task_info(
+            name,
+            TASK_AUDIT_TOKEN,
+            token.as_mut_ptr().cast(),
+            &mut count,
+        );
+        mach_port_deallocate(me, name);
+        // A short answer is no token, never a zero-filled one.
+        if rc != 0 || count != TASK_AUDIT_TOKEN_COUNT {
+            return None;
+        }
+        Token::from_words(&token)
+    }
+}
+
+/// The pid in a local socket's peer's audit token (its sixth word), read live (see [`audit_token_words`]):
+/// the process using the socket now, so a holder can require the one child it started (retrust).
 #[cfg(target_os = "macos")]
 pub fn peer_pid(socket: std::os::fd::BorrowedFd<'_>) -> Result<i32, String> {
     let token = audit_token(socket)?;
@@ -708,6 +806,60 @@ mod tests {
             peer_pid(ours.as_fd()),
             Ok(i32::try_from(std::process::id()).unwrap())
         );
+    }
+
+    /// A connection's peer, judged, is exactly the process using it: here this process, now, and its
+    /// pid, pidversion and euid are the raw token's words 5, 7 and 1 (moved from anemnez-service
+    /// product::peer, SHARED.md).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_peer_is_the_process_using_the_socket_and_its_words_say_so() {
+        use std::os::fd::AsFd;
+        let (a, _b) = std::os::unix::net::UnixStream::pair().expect("a pair");
+        let me = peer(a.as_fd()).expect("its peer");
+        assert_eq!(me.pid, std::process::id() as i32);
+        assert_eq!(current(me.pid), Some(me), "the same pid and pidversion, read live");
+        assert!(me.is(me.pid));
+        let words = audit_token_words(a.as_fd()).expect("its whole token");
+        assert_eq!((words[5] as i32, words[7] as i32), (me.pid, me.pidversion));
+        // SAFETY: geteuid has no preconditions.
+        assert_eq!(words[1], unsafe { libc::geteuid() }, "word 1 is the effective user");
+    }
+
+    /// A child that connects for itself is its own token, never its parent's; once it is gone its
+    /// token is no one.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_child_that_connects_is_not_its_parent() {
+        use std::os::fd::AsFd;
+        use std::process::{Command, Stdio};
+        let dir = tempfile::tempdir().expect("scratch");
+        let path = dir.path().join("c.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).expect("listen");
+        let mut child = Command::new("/usr/bin/nc")
+            .arg("-U")
+            .arg(&path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("nc");
+        let (stream, _) = listener.accept().expect("the child connects");
+        let them = peer(stream.as_fd()).expect("its peer");
+        let parent = current(std::process::id() as i32).expect("this process");
+        assert_eq!(them.pid, child.id() as i32, "the child, by pid");
+        assert_ne!(them, parent, "never its parent");
+        assert!(them.is(child.id() as i32), "and the child, exactly, while it runs");
+        child.kill().expect("the child is stopped");
+        child.wait().expect("the child ends");
+        drop(stream);
+        assert!(!them.is(child.id() as i32), "a pid no process runs is no one");
+    }
+
+    /// Another user's process is never read, so it is never matched.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn another_users_process_is_none() {
+        assert_eq!(current(1), None, "launchd runs as root");
     }
 
     /// The audit-token path, for real: a socket pair inside this test, so the peer is this test binary,
