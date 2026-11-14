@@ -1,0 +1,10 @@
+# Who may approve a train's exact head (repo/review-declared, E m/10346, v2.15 m/10350). Herald reads this at
+# the train's base. `reviewers`: any one suffices, and the steward is implied; `required`: every one must
+# approve as well. A steward never approves their own train (H m/10467), so the steward's own work needs a
+# second pair of eyes: D, who rules on the swarm's kernels and fences, or E, who reads every review.
+schema = 1
+steward = "G"
+
+[[paths]]
+glob = "**"
+reviewers = ["D", "E"]
