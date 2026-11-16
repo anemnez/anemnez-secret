@@ -104,3 +104,14 @@ spoken_for("a-key-goes-only-to-a-checked-successor", {
 	"retrust::tests::a_key_moves_to_a_checked_child_and_never_to_another",
 	"retrust::tests::only_the_spawned_childs_connection_is_taken",
 })
+
+spoken_for("a-signing-key-is-made-on-its-host-and-held-by-its-build", {
+	"signer::tests::a_key_is_made_only_when_nothing_is_held_and_no_hand_off_is_pending",
+	"signer::tests::a_key_is_made_once_then_adopted_never_remade",
+	"signer::tests::an_unavailable_keychain_never_makes_a_key",
+	"signer::tests::another_builds_item_is_refused_naming_it",
+	"signer::tests::a_successor_finishes_a_hand_off_cut_short",
+	"signer::tests::two_node_ids_hold_two_keys",
+	"signer::tests::a_key_never_prints_its_value",
+	"signer::tests::an_item_that_isnt_a_key_is_refused_by_name",
+})
