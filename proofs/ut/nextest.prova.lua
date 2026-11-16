@@ -110,6 +110,8 @@ spoken_for("a-signing-key-is-made-on-its-host-and-held-by-its-build", {
 	"signer::tests::a_key_is_made_once_then_adopted_never_remade",
 	"signer::tests::an_unavailable_keychain_never_makes_a_key",
 	"signer::tests::another_builds_item_is_refused_naming_it",
+	"signer::tests::another_builds_item_it_cannot_open_is_refused_as_theirs_not_unavailable",
+	"signer::tests::an_unnoted_item_of_another_identity_is_never_replaced",
 	"signer::tests::a_successor_finishes_a_hand_off_cut_short",
 	"signer::tests::two_node_ids_hold_two_keys",
 	"signer::tests::a_key_never_prints_its_value",

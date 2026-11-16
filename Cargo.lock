@@ -18,6 +18,7 @@ dependencies = [
  "security-framework-sys",
  "sha2",
  "tempfile",
+ "zeroize",
 ]
 
 [[package]]
