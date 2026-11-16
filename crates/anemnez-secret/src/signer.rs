@@ -126,19 +126,22 @@ pub fn step(read: Read) -> Step {
 /// The key held under `item` by this build (`made_by`, its designated requirement), made here if none is
 /// held. Never remade: a held key is read back, an Unavailable keychain is an error, and another build's
 /// item is refused by name. The host of [`step`]: it reads custody, and does what `step` says.
+///
+/// It decides from the item's attributes (`held`, `maker`) before it opens the value (G m/15111): another
+/// build's item fails the keychain's access list on `get`, so deciding from `get` would read it as
+/// Unavailable, "try later", when what it needs is a hand-off. The value is read only to use it.
 pub fn adopt(keychain: &Keychain, item: &Item, made_by: &str) -> Result<(SigningKey, Adopted), SignerError> {
-    let got = keychain.get(item);
-    let read = match &got {
-        Ok(_) => Read::Held { ours: keychain.maker(item).as_deref() == Some(made_by) },
-        Err(CustodyError::NotHeld(_)) => Read::NotHeld { next: matches!(keychain.held(&item.next()), Ok(true)) },
+    let read = match keychain.held(item) {
+        Ok(true) => Read::Held { ours: keychain.maker(item).as_deref() == Some(made_by) },
+        Ok(false) => Read::NotHeld { next: matches!(keychain.held(&item.next()), Ok(true)) },
         Err(CustodyError::Unavailable { .. }) => Read::Unavailable,
         Err(e) => return Err(SignerError::Store(e.to_string())),
     };
     match step(read) {
-        Step::Use => match got {
-            Ok(secret) => Ok((held_by(keychain, item, made_by, &secret)?, Adopted::Held)),
-            Err(e) => Err(SignerError::Store(e.to_string())),
-        },
+        Step::Use => {
+            let secret = keychain.get(item).map_err(|e| unavailable(keychain, item, made_by, e))?;
+            Ok((held_by(keychain, item, made_by, &secret)?, Adopted::Held))
+        }
         Step::RefuseAnothers => Err(SignerError::AnotherBuilds {
             item: item.clone(),
             maker: keychain.maker(item),
@@ -161,14 +164,17 @@ pub fn adopt(keychain: &Keychain, item: &Item, made_by: &str) -> Result<(Signing
 fn make(keychain: &Keychain, item: &Item, made_by: &str) -> Result<(SigningKey, Adopted), SignerError> {
     let key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let made = key.verifying_key();
-    match keychain.add(item, &Secret::new(hex(&key.to_bytes()).into_bytes()), made_by) {
+    let value = zeroize::Zeroizing::new(hex(&key.to_bytes()));
+    match keychain.add(item, &Secret::new(value.as_bytes().to_vec()), made_by) {
         Ok(()) => {}
         // Another process made it first: read its, never write over it.
         Err(CustodyError::Exists(_)) => {
             let secret = keychain.get(item).map_err(|e| unavailable(keychain, item, made_by, e))?;
             return Ok((held_by(keychain, item, made_by, &secret)?, Adopted::Held));
         }
-        Err(e) => return Err(SignerError::Store(e.to_string())),
+        // A keychain that can't be written now (locked) made nothing: said as Unavailable, never as a
+        // store failure, so the caller tries later rather than reads it as broken.
+        Err(e) => return Err(unavailable(keychain, item, made_by, e)),
     }
     let back = keychain.get(item).map_err(|e| unavailable(keychain, item, made_by, e))?;
     let kept = parse(item, &back)?;
@@ -200,7 +206,7 @@ fn unavailable(keychain: &Keychain, item: &Item, made_by: &str, e: CustodyError)
 fn parse(item: &Item, secret: &Secret) -> Result<SigningKey, SignerError> {
     secret.expose(|value| {
         let text = std::str::from_utf8(value).map_err(|_| SignerError::NotAKey(item.clone()))?.trim();
-        let mut bytes = [0u8; 32];
+        let mut bytes = zeroize::Zeroizing::new([0u8; 32]);
         if text.len() != 64 {
             return Err(SignerError::NotAKey(item.clone()));
         }
@@ -266,8 +272,22 @@ mod tests {
     #[test]
     fn an_unavailable_keychain_never_makes_a_key() {
         let (_dir, k, path) = keychain();
+        let it = item("node-a");
+        // Locked, with dialogs off: custody answers Unavailable, never NotHeld.
+        let locked = std::process::Command::new("/usr/bin/security").arg("lock-keychain").arg(&path).status();
+        assert!(locked.is_ok_and(|s| s.success()), "locked");
+        let got = adopt(&k, &it, ME);
+        assert!(matches!(got, Err(SignerError::Unavailable { .. })), "{got:?}");
+        let k = Keychain::open_at(&path, "proof-only").expect("unlocked again");
+        assert!(!k.held(&it).unwrap_or(true), "nothing was made while it was locked");
+    }
+
+    /// An item another code identity made, with no made-by note: whose it is can't be told, so it is
+    /// refused, and nothing is made beside it.
+    #[test]
+    fn an_unnoted_item_of_another_identity_is_never_replaced() {
+        let (_dir, k, path) = keychain();
         let theirs = item("node-a");
-        // Made by another code identity (/usr/bin/security), so this build reads it as Unavailable.
         let made = std::process::Command::new("/usr/bin/security")
             .args(["add-generic-password", "-s", &theirs.service, "-a", &theirs.account, "-w", "not-ours"])
             .arg(&path)
@@ -275,9 +295,8 @@ mod tests {
             .expect("security");
         assert!(made.success());
         let got = adopt(&k, &theirs, ME);
-        assert!(matches!(got, Err(SignerError::Unavailable { .. })), "{got:?}");
-        assert!(k.held(&theirs).unwrap_or(false), "the item is still there");
-        assert!(!k.held(&theirs.next()).unwrap_or(true), "and nothing was made beside it");
+        assert!(matches!(got, Err(SignerError::AnotherBuilds { maker: None, .. })), "{got:?}");
+        assert!(!k.held(&theirs.next()).unwrap_or(true), "nothing was made beside it");
     }
 
     #[test]
@@ -289,6 +308,33 @@ mod tests {
         assert!(matches!(&got, Err(SignerError::AnotherBuilds { maker: Some(m), .. }) if m == OTHER), "{got:?}");
         let said = got.err().map(|e| e.to_string()).unwrap_or_default();
         assert!(said.contains("ai.anemnez.otherd") && !said.contains("1111"), "{said}");
+    }
+
+    /// G m/15111: in production another build's item fails the access list, so only its attributes say
+    /// whose it is. Written by /usr/bin/security (another code identity) and noted as another build's.
+    #[test]
+    fn another_builds_item_it_cannot_open_is_refused_as_theirs_not_unavailable() {
+        let (_dir, k, path) = keychain();
+        let theirs = item("node-a");
+        let comment = format!("made by: {OTHER}");
+        let made = std::process::Command::new("/usr/bin/security")
+            .args([
+                "add-generic-password",
+                "-s",
+                &theirs.service,
+                "-a",
+                &theirs.account,
+                "-j",
+                &comment,
+                "-w",
+                "not-ours",
+            ])
+            .arg(&path)
+            .status()
+            .expect("security");
+        assert!(made.success());
+        let got = adopt(&k, &theirs, ME);
+        assert!(matches!(&got, Err(SignerError::AnotherBuilds { maker: Some(m), .. }) if m == OTHER), "{got:?}");
     }
 
     #[test]

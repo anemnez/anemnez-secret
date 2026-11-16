@@ -18,6 +18,8 @@ libc = "0.2"
 # signer: a host's own Ed25519 key, made from the OS's entropy.
 ed25519-dalek = { version = "2.2", features = ["rand_core"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
+# signer: the key's plain copies (hex, the decoded bytes) are wiped on drop, as Secret and dalek's key are.
+zeroize = "1"
 # Custody calls the Security framework directly, so a value never passes through a command line.
 security-framework = "3"
 # identity: the running code behind a socket's audit token, and its signing information.
