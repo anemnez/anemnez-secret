@@ -62,6 +62,22 @@ configured, and one of any other team only through the owner check, which names 
 does the hand-off run over the connection. A product's binary that finds `ANEMNEZ_RETRUST_SOCKET` set
 runs `retrust::serve` and nothing else.
 
+<!-- claim: a-signing-key-is-made-on-its-host-and-held-by-its-build -->
+**A product's own signing key is made on the host that uses it and held by the build that made it**
+(`signer`; moved from Artichoke's role keyring by rule 2, N m/15079, G m/15083). A key is identity, so it
+never travels (LADON §3). `signer::adopt(keychain, item, made_by)` answers the build's Ed25519 key:
+- **Made once, never remade.** If nothing is held, it is made from the OS's entropy and added. A held
+  item is read back, and a race to make one reads the winner's.
+- **Unavailable never makes one.** A keychain that can't be read now is an error naming the item's maker
+  and this build. Custody's `add` never overwrites, so nothing can be made over it either way.
+- **Another build's item is refused by name.** An item whose `made by:` isn't this build's is refused,
+  naming it. A successor takes a key only by a hand-off, and a hand-off cut short (its `.next` held,
+  the item not) is finished by `handoff::finish`.
+- **It never prints and never leaves.** The key signs and hands out its public half. Its `Debug` shows
+  only the public half, and nothing exports its bytes.
+- The service, the account and the requirement are the caller's. `<signer>@<node id>` is the default
+  account shape, so two hosts hold two keys.
+
 ## 3. Identity: one place a code signature is judged
 
 <!-- claim: a-caller-is-known-by-its-code-signature -->
