@@ -121,6 +121,16 @@ impl std::fmt::Display for CustodyError {
 
 impl std::error::Error for CustodyError {}
 
+/// What [`Keychain::accounts`] found under a service.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Accounts {
+    /// Each account held, sorted.
+    pub names: Vec<String>,
+    /// Items found under the service whose attributes didn't read or named no account: held, but not
+    /// nameable, so a caller must say so rather than read them as absent.
+    pub unreadable: usize,
+}
+
 /// A keychain, for custody.
 pub struct Keychain {
     /// None: the user's default keychain (the login keychain).
@@ -256,6 +266,43 @@ impl Keychain {
         self.remove(from)
     }
 
+    /// The accounts held under `service`, found by their attributes alone: no value is read into memory
+    /// to answer. A caller that keeps derived copies sweeps them by this (Ladon's copy sweep), so an
+    /// item nobody asks for again is still found. Sorted, so the answer is the same however the
+    /// keychain orders it. An item the search found under `service` whose attributes don't read, or
+    /// that names no account, is never dropped silently: it is counted in [`Accounts::unreadable`], so
+    /// a sweep can say what it could not reach (D m/14807). The Security framework gives no way to
+    /// plant such an item in a proof, so that count is stated here rather than shown by a row.
+    pub fn accounts(&self, service: &str) -> Result<Accounts, CustodyError> {
+        use security_framework::item::{ItemClass, ItemSearchOptions, Limit};
+        let mut search = ItemSearchOptions::new();
+        search.class(ItemClass::generic_password()).service(service).load_attributes(true).load_data(false);
+        search.limit(Limit::All);
+        if let Some(keychain) = &self.keychain {
+            search.keychains(std::slice::from_ref(keychain));
+        }
+        let found = match search.search() {
+            Ok(found) => found,
+            Err(e) if e.code() == NOT_FOUND => return Ok(Accounts::default()),
+            Err(e) => return Err(Self::error(&Item::new(service, "*"), &e)),
+        };
+        let mut accounts = Accounts::default();
+        for attributes in found.iter().map(|f| f.simplify_dict()) {
+            match attributes {
+                // Another service: the search's own filter should never return one, but it is not ours.
+                Some(a) if a.get("svce").is_some_and(|s| s != service) => {}
+                Some(a) => match a.get("acct") {
+                    Some(account) => accounts.names.push(account.clone()),
+                    None => accounts.unreadable += 1,
+                },
+                None => accounts.unreadable += 1,
+            }
+        }
+        accounts.names.sort();
+        accounts.names.dedup();
+        Ok(accounts)
+    }
+
     /// Whether `item` exists, found by its attributes alone: the value is never read into memory to
     /// answer.
     pub fn held(&self, item: &Item) -> Result<bool, CustodyError> {
@@ -281,7 +328,7 @@ impl Keychain {
 
 #[cfg(test)]
 mod tests {
-    use super::{CustodyError, Item, Keychain};
+    use super::{Accounts, CustodyError, Item, Keychain};
     use crate::Secret;
 
     const VALUE: &str = "ed25519-seed-0123456789ZZZtopSECRETvalue";
@@ -312,6 +359,23 @@ mod tests {
         k.remove(&item).unwrap();
         assert!(!k.held(&item).unwrap());
         assert!(matches!(k.remove(&item), Err(CustodyError::NotHeld(_))));
+    }
+
+    /// `SECRET.md#a-held-key-is-read-only-by-its-owning-build`: `accounts` names every item under a
+    /// service and nothing under another, never reading a value, and an empty service is no error.
+    #[test]
+    fn accounts_names_each_item_under_its_service_alone() {
+        let (_dir, k) = keychain();
+        assert_eq!(k.accounts("ai.anemnez.example.copies").unwrap(), Accounts::default());
+        for account in ["b", "a", "c"] {
+            k.put(&Item::new("ai.anemnez.example.copies", account), Secret::new(VALUE.into())).unwrap();
+        }
+        k.put(&Item::new("ai.anemnez.example.copies.other", "z"), Secret::new(VALUE.into())).unwrap();
+        k.put(&Item::new("ai.anemnez.example", "y"), Secret::new(VALUE.into())).unwrap();
+        let found = k.accounts("ai.anemnez.example.copies").unwrap();
+        assert_eq!((found.names, found.unreadable), (vec!["a".to_owned(), "b".into(), "c".into()], 0));
+        k.remove(&Item::new("ai.anemnez.example.copies", "b")).unwrap();
+        assert_eq!(k.accounts("ai.anemnez.example.copies").unwrap().names, ["a", "c"]);
     }
 
     /// `SECRET.md#a-held-key-is-read-only-by-its-owning-build` (F, 2026-11-06): an item another code
