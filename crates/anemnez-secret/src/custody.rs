@@ -129,6 +129,9 @@ pub struct Accounts {
     /// Items found under the service whose attributes didn't read or named no account: held, but not
     /// nameable, so a caller must say so rather than read them as absent.
     pub unreadable: usize,
+    /// Each account's note, as [`Keychain::put_noted`] wrote it (its description attribute), read with
+    /// the names and never with a value. An account with no note is absent here.
+    pub notes: std::collections::BTreeMap<String, String>,
 }
 
 /// A keychain, for custody.
@@ -194,6 +197,44 @@ impl Keychain {
             }
         };
         written.map_err(|e| Self::error(item, &e))
+    }
+
+    /// Keep `value` under `item`, replacing what was there, with `note` in the item's description
+    /// attribute: a small fact about the value (when it was made, say) that [`Self::accounts`] returns
+    /// without the value ever being read. An existing item is updated in place, keeping its access
+    /// list; a new one is written by the calling binary, as [`Self::put`] writes it.
+    pub fn put_noted(&self, item: &Item, value: &Secret, note: &str) -> Result<(), CustodyError> {
+        use security_framework::item::{
+            ItemAddOptions, ItemAddValue, ItemClass, ItemSearchOptions, ItemUpdateOptions, ItemUpdateValue, Location,
+            update_item,
+        };
+        let data = || value.expose(core_foundation::data::CFData::from_buffer);
+        let mut search = ItemSearchOptions::new();
+        search.class(ItemClass::generic_password()).service(&item.service).account(&item.account);
+        if let Some(keychain) = &self.keychain {
+            search.keychains(std::slice::from_ref(keychain));
+        }
+        let mut update = ItemUpdateOptions::new();
+        update.set_value(ItemUpdateValue::Data(data())).set_description(note);
+        match update_item(&search, &update) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.code() == NOT_FOUND => {}
+            Err(e) => return Err(Self::error(item, &e)),
+        }
+        let mut add = ItemAddOptions::new(ItemAddValue::Data { class: ItemClass::generic_password(), data: data() });
+        add.set_service(&item.service)
+            .set_account_name(&item.account)
+            .set_label(format!("{} / {}", item.service, item.account))
+            .set_description(note);
+        if let Some(keychain) = &self.keychain {
+            add.set_location(Location::FileKeychain(keychain.clone()));
+        }
+        match add.add() {
+            Ok(()) => Ok(()),
+            // Another writer added it between the two calls: update the one now there.
+            Err(e) if e.code() == DUPLICATE => update_item(&search, &update).map_err(|e| Self::error(item, &e)),
+            Err(e) => Err(Self::error(item, &e)),
+        }
     }
 
     /// The value under `item`.
@@ -292,7 +333,12 @@ impl Keychain {
                 // Another service: the search's own filter should never return one, but it is not ours.
                 Some(a) if a.get("svce").is_some_and(|s| s != service) => {}
                 Some(a) => match a.get("acct") {
-                    Some(account) => accounts.names.push(account.clone()),
+                    Some(account) => {
+                        if let Some(note) = a.get("desc") {
+                            accounts.notes.insert(account.clone(), note.clone());
+                        }
+                        accounts.names.push(account.clone());
+                    }
                     None => accounts.unreadable += 1,
                 },
                 None => accounts.unreadable += 1,
@@ -374,8 +420,33 @@ mod tests {
         k.put(&Item::new("ai.anemnez.example", "y"), Secret::new(VALUE.into())).unwrap();
         let found = k.accounts("ai.anemnez.example.copies").unwrap();
         assert_eq!((found.names, found.unreadable), (vec!["a".to_owned(), "b".into(), "c".into()], 0));
+        assert!(found.notes.is_empty(), "a plain put leaves no note");
         k.remove(&Item::new("ai.anemnez.example.copies", "b")).unwrap();
         assert_eq!(k.accounts("ai.anemnez.example.copies").unwrap().names, ["a", "c"]);
+    }
+
+    /// `SECRET.md#a-held-key-is-read-only-by-its-owning-build`: a noted put keeps its note beside the
+    /// value, `accounts` returns the note with the name and never the value, a second noted put replaces
+    /// both, and a noted put over a plain item adds the note to it.
+    #[test]
+    fn a_noted_put_keeps_its_note_where_accounts_reads_it() {
+        let (_dir, k) = keychain();
+        let service = "ai.anemnez.example.copies";
+        let (a, b) = (Item::new(service, "a"), Item::new(service, "b"));
+        k.put_noted(&a, &Secret::new(VALUE.into()), "1793900000").unwrap();
+        assert_eq!(k.get(&a).unwrap().expose(|v| v.to_vec()), VALUE.as_bytes());
+        let found = k.accounts(service).unwrap();
+        assert_eq!((found.names, found.notes.get("a").map(String::as_str)), (vec!["a".to_owned()], Some("1793900000")));
+
+        k.put_noted(&a, &Secret::new(b"rotated".to_vec()), "1793903600").unwrap();
+        assert_eq!(k.get(&a).unwrap().expose(|v| v.to_vec()), b"rotated", "the value is replaced");
+        assert_eq!(k.accounts(service).unwrap().notes["a"], "1793903600", "and the note with it");
+
+        k.put(&b, Secret::new(VALUE.into())).unwrap();
+        assert!(!k.accounts(service).unwrap().notes.contains_key("b"));
+        k.put_noted(&b, &Secret::new(VALUE.into()), "1793907200").unwrap();
+        assert_eq!(k.accounts(service).unwrap().notes["b"], "1793907200", "a plain item gains the note");
+        assert_eq!(k.accounts(service).unwrap().names, ["a", "b"], "updated in place, never a second item");
     }
 
     /// `SECRET.md#a-held-key-is-read-only-by-its-owning-build` (F, 2026-11-06): an item another code
