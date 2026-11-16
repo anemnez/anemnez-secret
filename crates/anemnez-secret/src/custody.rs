@@ -54,6 +54,30 @@ mod quiet {
     }
 }
 
+/// Whether a keychain is unlocked. A search by attributes on a locked keychain finds nothing rather than
+/// failing, so "not held" there would be a guess: custody asks first, and says Unavailable (N m/15128).
+mod lock {
+    use core_foundation::base::TCFType as _;
+    use security_framework::os::macos::keychain::SecKeychain;
+    use security_framework_sys::base::SecKeychainRef;
+
+    /// kSecUnlockStateStatus.
+    const UNLOCKED: u32 = 1;
+
+    unsafe extern "C" {
+        fn SecKeychainGetStatus(keychain: SecKeychainRef, status: *mut u32) -> i32;
+    }
+
+    /// `keychain`'s lock state (None: the user's default keychain), or the status the read failed with.
+    pub(super) fn unlocked(keychain: Option<&SecKeychain>) -> Result<bool, i32> {
+        let raw = keychain.map_or(std::ptr::null_mut(), |k| k.as_concrete_TypeRef());
+        let mut status = 0u32;
+        // SAFETY: a plain out-parameter read; a null keychain is the default one, as the API documents.
+        let code = unsafe { SecKeychainGetStatus(raw, &mut status) };
+        if code == 0 { Ok(status & UNLOCKED != 0) } else { Err(code) }
+    }
+}
+
 /// errSecItemNotFound.
 const NOT_FOUND: i32 = -25300;
 /// errSecInteractionNotAllowed: the keychain is locked and may not prompt.
@@ -172,6 +196,16 @@ impl Keychain {
         keychain.unlock(Some(password)).map_err(|e| e.to_string())?;
         quiet::off();
         Ok(Self { keychain: Some(keychain) })
+    }
+
+    /// Unavailable for `item` when the keychain is locked (or its state can't be read): an attribute search
+    /// then answers nothing, which must never read as "not held".
+    fn readable(&self, item: &Item) -> Result<(), CustodyError> {
+        match lock::unlocked(self.keychain.as_ref()) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(CustodyError::Unavailable { item: item.clone(), status: INTERACTION_NOT_ALLOWED }),
+            Err(status) => Err(CustodyError::Unavailable { item: item.clone(), status }),
+        }
     }
 
     fn keychains(&self) -> Option<Vec<SecKeychain>> {
@@ -316,6 +350,7 @@ impl Keychain {
     /// plant such an item in a proof, so that count is stated here rather than shown by a row.
     pub fn accounts(&self, service: &str) -> Result<Accounts, CustodyError> {
         use security_framework::item::{ItemClass, ItemSearchOptions, Limit};
+        self.readable(&Item::new(service, "*"))?;
         let mut search = ItemSearchOptions::new();
         search.class(ItemClass::generic_password()).service(service).load_attributes(true).load_data(false);
         search.limit(Limit::All);
@@ -324,7 +359,9 @@ impl Keychain {
         }
         let found = match search.search() {
             Ok(found) => found,
-            Err(e) if e.code() == NOT_FOUND => return Ok(Accounts::default()),
+            Err(e) if e.code() == NOT_FOUND => {
+                return self.readable(&Item::new(service, "*")).map(|()| Accounts::default());
+            }
             Err(e) => return Err(Self::error(&Item::new(service, "*"), &e)),
         };
         let mut accounts = Accounts::default();
@@ -346,6 +383,10 @@ impl Keychain {
         }
         accounts.names.sort();
         accounts.names.dedup();
+        if accounts.names.is_empty() && accounts.unreadable == 0 {
+            // As for held: an empty list is confirmed against the lock state once more (D m/15135).
+            self.readable(&Item::new(service, "*"))?;
+        }
         Ok(accounts)
     }
 
@@ -353,6 +394,7 @@ impl Keychain {
     /// answer.
     pub fn held(&self, item: &Item) -> Result<bool, CustodyError> {
         use security_framework::item::{ItemClass, ItemSearchOptions, Limit};
+        self.readable(item)?;
         let mut search = ItemSearchOptions::new();
         search
             .class(ItemClass::generic_password())
@@ -364,9 +406,12 @@ impl Keychain {
         if let Some(keychain) = &self.keychain {
             search.keychains(std::slice::from_ref(keychain));
         }
+        // An empty answer is confirmed against the lock state once more: a keychain locked between the first
+        // read and the search finds nothing, which isn't "not held" (D m/15135). A found item needs no second read.
         match search.search() {
-            Ok(found) => Ok(!found.is_empty()),
-            Err(e) if e.code() == NOT_FOUND => Ok(false),
+            Ok(found) if !found.is_empty() => Ok(true),
+            Ok(_) => self.readable(item).map(|()| false),
+            Err(e) if e.code() == NOT_FOUND => self.readable(item).map(|()| false),
             Err(e) => Err(Self::error(item, &e)),
         }
     }
@@ -423,6 +468,25 @@ mod tests {
         assert!(found.notes.is_empty(), "a plain put leaves no note");
         k.remove(&Item::new("ai.anemnez.example.copies", "b")).unwrap();
         assert_eq!(k.accounts("ai.anemnez.example.copies").unwrap().names, ["a", "c"]);
+    }
+
+    /// `SECRET.md#a-held-key-is-read-only-by-its-owning-build`, "locked is not logged out" (N m/15128): on a
+    /// locked keychain, `held` and `accounts` answer Unavailable, never "not held" or an empty list, though an
+    /// attribute search there finds nothing; unlocked again, the item is there.
+    #[test]
+    fn a_locked_keychain_is_unavailable_to_an_attribute_search_never_empty() {
+        let dir = tempfile::tempdir().expect("scratch");
+        let path = dir.path().join("proof.keychain-db");
+        let k = Keychain::create_at(&path, "proof-only").expect("a keychain of its own");
+        let item = Item::new("ai.anemnez.example.copies", "a");
+        k.put(&item, Secret::new(VALUE.into())).unwrap();
+        assert!(k.held(&item).unwrap());
+        let locked = std::process::Command::new("/usr/bin/security").arg("lock-keychain").arg(&path).status();
+        assert!(locked.is_ok_and(|s| s.success()), "locked");
+        assert!(matches!(k.held(&item), Err(CustodyError::Unavailable { .. })), "{:?}", k.held(&item));
+        assert!(matches!(k.accounts("ai.anemnez.example.copies"), Err(CustodyError::Unavailable { .. })));
+        let k = Keychain::open_at(&path, "proof-only").expect("unlocked again");
+        assert!(k.held(&item).unwrap(), "unlocked, it's there");
     }
 
     /// `SECRET.md#a-held-key-is-read-only-by-its-owning-build`: a noted put keeps its note beside the
