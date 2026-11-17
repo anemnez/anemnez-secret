@@ -304,11 +304,14 @@ pub enum Signer {
 }
 
 /// A running process's code identity, verified from its audit token (never its pid alone, never its Info.plist): its
-/// signing identifier and who signed it.
+/// signing identifier and who signed it, and the process it was read from, exactly, so a caller can hold the same
+/// process from the read to its act (G m/16009): a pid reused, or an exec, is another [`Token`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CodeIdentity {
     pub identifier: String,
     pub signer: Signer,
+    /// The process read: its pid and pidversion, from the same audit token the code was found by.
+    pub process: Token,
 }
 
 /// Who signed a code, from what the Security calls answered: whether it satisfies `anchor apple`, whether it satisfies
@@ -344,7 +347,9 @@ pub fn code_of_pid(pid: i32) -> Result<CodeIdentity, String> {
     let token: Vec<u8> = words.iter().flat_map(|w| w.to_ne_bytes()).collect();
     let code = macos::guest_by_audit(&token)?;
     let (identifier, apple, generic, team) = macos::code_identity(&code)?;
-    Ok(CodeIdentity { identifier, signer: signer(apple, generic, team) })
+    // audit_token_to_pidversion: word 7, from the same token.
+    let process = Token { pid, pidversion: words[7] as i32 };
+    Ok(CodeIdentity { identifier, signer: signer(apple, generic, team), process })
 }
 
 /// Off macOS there is no code identity to read.
@@ -636,6 +641,7 @@ mod tests {
         drop(sleep.kill());
         drop(sleep.wait());
         let read = read.expect("sleep's code identity");
+        assert_eq!(read.process.pid, pid, "the process read is the one asked");
         assert_eq!((read.identifier.as_str(), read.signer), ("com.apple.sleep", Signer::Apple));
         assert!(code_of_pid(pid).is_err(), "an exited pid is Err");
     }
@@ -648,6 +654,7 @@ mod tests {
         let read = super::code_of_pid(me).expect("this process's code identity");
         assert!(!read.identifier.is_empty());
         assert_eq!(read.signer, super::Signer::AdHoc, "{read:?}");
+        assert_eq!(Some(read.process), super::current(me), "the same process current() names: pid and pidversion");
     }
 
     /// (D, 2026-11-06) a verdict is checked once per process: a verified identity and a refusal the
