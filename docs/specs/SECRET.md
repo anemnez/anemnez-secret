@@ -102,6 +102,18 @@ moved from fabric's step 0 `writers.rs`).
 - A verdict vouches for the process that connected, at connect, not for whoever later holds the socket,
   so a product never passes its connection on.
 
+<!-- claim: a-processs-code-identity-is-read-from-its-audit-token -->
+**Any process's code identity is read from its audit token, by value** (K, G m/15989; for miniond's consent floor,
+I m/15971). `identity::code_of_pid(pid)` takes the pid's audit token (`task_name_for_pid`, then
+`TASK_AUDIT_TOKEN`), holds the token's own pid to the one asked, finds the running code by that token
+(`kSecGuestAttributeAudit`, never the pid alone), and validates it with `kSecCSStrictValidate`, no flag loosened.
+Only then does it read the signing identifier and decide the [`Signer`] by requirement, in one pure function
+(`signer`): `Apple` for `anchor apple`, `Team(id)` for `anchor apple generic` with the team its signature names, and
+`AdHoc` for anything else that is valid. Unlike `of_peer`, it judges no hardened runtime and trusts no team: it says
+who signed a process, and the caller decides (a consent surface is refused, never admitted, by what it finds). A
+process that is gone, isn't this user's to name, or isn't valid is Err, and a caller that guards with it refuses.
+It blocks, as `of_peer` does.
+
 ## 4. The owner is proven, never assumed
 
 <!-- claim: the-owner-is-proven-never-assumed -->
