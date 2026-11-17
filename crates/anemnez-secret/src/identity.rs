@@ -257,6 +257,13 @@ pub fn peer(socket: std::os::fd::BorrowedFd<'_>) -> Result<Token, String> {
 /// (`task_name_for_pid`, then `TASK_AUDIT_TOKEN`).
 #[cfg(target_os = "macos")]
 pub fn current(pid: i32) -> Option<Token> {
+    task_audit_token(pid).and_then(|words| Token::from_words(&words))
+}
+
+/// The audit token of the process running as `pid` now, by value (`task_name_for_pid`, then `TASK_AUDIT_TOKEN`), or
+/// `None` when there is none or this process may not name it (another user's).
+#[cfg(target_os = "macos")]
+fn task_audit_token(pid: i32) -> Option<[u32; 8]> {
     /// `TASK_AUDIT_TOKEN` and its count (mach/task_info.h); libc does not carry them.
     const TASK_AUDIT_TOKEN: libc::c_uint = 15;
     const TASK_AUDIT_TOKEN_COUNT: libc::mach_msg_type_number_t = 8;
@@ -281,8 +288,72 @@ pub fn current(pid: i32) -> Option<Token> {
         if rc != 0 || count != TASK_AUDIT_TOKEN_COUNT {
             return None;
         }
-        Token::from_words(&token)
+        Some(token)
     }
+}
+
+/// Who signed a running code, as [`code_of_pid`] decides it by requirement (G m/15989).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Signer {
+    /// It satisfies `anchor apple`: Apple's own code, a platform binary.
+    Apple,
+    /// It satisfies `anchor apple generic` and names this verified team id.
+    Team(String),
+    /// Valid, but under neither anchor: ad hoc, or a certificate a host made itself.
+    AdHoc,
+}
+
+/// A running process's code identity, verified from its audit token (never its pid alone, never its Info.plist): its
+/// signing identifier and who signed it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CodeIdentity {
+    pub identifier: String,
+    pub signer: Signer,
+}
+
+/// Who signed a code, from what the Security calls answered: whether it satisfies `anchor apple`, whether it satisfies
+/// `anchor apple generic`, and the team id its signing information names. Pure, so each case has a row. A team id is
+/// believed only under the generic anchor; anything else valid is [`Signer::AdHoc`].
+#[must_use]
+pub fn signer(apple: bool, apple_generic: bool, team: Option<String>) -> Signer {
+    match (apple, apple_generic, team) {
+        (true, _, _) => Signer::Apple,
+        (false, true, Some(team)) if !team.is_empty() => Signer::Team(team),
+        _ => Signer::AdHoc,
+    }
+}
+
+/// The code identity of the process running as `pid` now (G m/15989; miniond's consent floor, I m/15971): its audit
+/// token read by value and held to `pid`, the running code that token names (`kSecGuestAttributeAudit`, never the pid
+/// alone), validated strictly with no flag loosened, and its [`Signer`] decided by requirement. Err when there is no
+/// such process, when it isn't this process's to name (another user's, as SecurityAgent may be), or when its code
+/// isn't valid: a caller that guards with it refuses on Err, the safe direction.
+/// BLOCKS, possibly for seconds: never on an async worker (see the module docs).
+///
+/// # Errors
+/// Why the code identity couldn't be read, in words.
+#[cfg(target_os = "macos")]
+pub fn code_of_pid(pid: i32) -> Result<CodeIdentity, String> {
+    let words =
+        task_audit_token(pid).ok_or_else(|| format!("pid {pid}: no audit token (gone, or not ours to name)"))?;
+    // audit_token_to_pid (bsm/libbsm.h): word 5. The token read must be the pid asked, by value.
+    let named = i32::try_from(words[5]).map_err(|_| format!("pid {pid}: its audit token names no pid"))?;
+    if named != pid {
+        return Err(format!("pid {pid}: its audit token names pid {named}"));
+    }
+    let token: Vec<u8> = words.iter().flat_map(|w| w.to_ne_bytes()).collect();
+    let code = macos::guest_by_audit(&token)?;
+    let (identifier, apple, generic, team) = macos::code_identity(&code)?;
+    Ok(CodeIdentity { identifier, signer: signer(apple, generic, team) })
+}
+
+/// Off macOS there is no code identity to read.
+///
+/// # Errors
+/// Always.
+#[cfg(not(target_os = "macos"))]
+pub fn code_of_pid(_: i32) -> Result<CodeIdentity, String> {
+    Err("code identity is read only on macOS".to_owned())
 }
 
 /// The pid in a local socket's peer's audit token (its sixth word), read live (see [`audit_token_words`]):
@@ -438,20 +509,72 @@ mod macos {
         guest(key, CFNumber::from(pid).as_CFType())
     }
 
+    /// `SecCodeCheckValidity` with `kSecCSStrictValidate` (no flag loosened) against `requirement`, or validity alone
+    /// when `None`: its OSStatus, for each caller to word. Err only when the requirement doesn't parse.
+    fn validity(code: &Code, requirement: Option<&str>) -> Result<i32, String> {
+        let mut req: SecRequirementRef = std::ptr::null_mut();
+        if let Some(requirement) = requirement {
+            let text = CFString::new(requirement);
+            // SAFETY: a well-formed requirement string; `req` is +1 on success.
+            let status = unsafe { SecRequirementCreateWithString(text.as_concrete_TypeRef(), 0, &mut req) };
+            if status != 0 || req.is_null() {
+                return Err(format!("the requirement does not parse (OSStatus {status})"));
+            }
+        }
+        // SAFETY: a valid code ref; `req` is valid or null (validity alone).
+        let status = unsafe { SecCodeCheckValidity(code.0, kSecCSStrictValidate, req) };
+        if !req.is_null() {
+            // SAFETY: ours (+1), released once.
+            unsafe { CFRelease(req.cast()) };
+        }
+        Ok(status)
+    }
+
+    /// `errSecCSReqFailed`: the code is valid but doesn't satisfy the requirement.
+    const REQ_FAILED: i32 = -67050;
+
+    /// Whether `code` (already strictly valid) satisfies `requirement`: Ok(false) only for errSecCSReqFailed, every
+    /// other failure an Err.
+    fn satisfies(code: &Code, requirement: &str) -> Result<bool, String> {
+        match validity(code, Some(requirement))? {
+            0 => Ok(true),
+            REQ_FAILED => Ok(false),
+            other => Err(format!("its code is not strictly valid (OSStatus {other})")),
+        }
+    }
+
+    /// A running code's identifier, whether it satisfies `anchor apple` and `anchor apple generic`, and the team id
+    /// its signing information names: validated strictly first (no requirement, no flag loosened), and nothing read
+    /// from its signature before that passes.
+    pub(super) fn code_identity(code: &Code) -> Result<(String, bool, bool, Option<String>), String> {
+        let status = validity(code, None)?;
+        if status != 0 {
+            return Err(format!("its code is not strictly valid (OSStatus {status})"));
+        }
+        let apple = satisfies(code, "anchor apple")?;
+        let generic = satisfies(code, super::APPLE_ANCHORED)?;
+        let mut info: CFDictionaryRef = std::ptr::null();
+        // SAFETY: a valid code ref (a SecCode is accepted where a SecStaticCode is); `info` is +1 on success.
+        let status = unsafe { SecCodeCopySigningInformation(code.0.cast(), INFORMATION, &mut info) };
+        if status != 0 || info.is_null() {
+            return Err(format!("its signing information cannot be read (OSStatus {status})"));
+        }
+        // SAFETY: a +1 dictionary, owned from here.
+        let info: CFDictionary<CFString, CFType> = unsafe { CFDictionary::wrap_under_create_rule(info) };
+        let text = |key: &str| {
+            info.find(CFString::new(key))
+                .map(|v| v.clone())
+                .and_then(|v| v.downcast::<CFString>())
+                .map(|s| s.to_string())
+        };
+        let identifier = text("identifier").ok_or("its signature names no identifier")?;
+        Ok((identifier, apple, generic, text("teamid")))
+    }
+
     /// Whether `code` meets `requirement`, validated strictly, and what its signature then says. Nothing is
     /// read from the signature before the check passes.
     pub(super) fn check(code: &Code, requirement: &str) -> Result<super::Signature, String> {
-        let mut req: SecRequirementRef = std::ptr::null_mut();
-        let text = CFString::new(requirement);
-        // SAFETY: a well-formed requirement string; `req` is +1 on success.
-        let status = unsafe { SecRequirementCreateWithString(text.as_concrete_TypeRef(), 0, &mut req) };
-        if status != 0 || req.is_null() {
-            return Err(format!("the requirement does not parse (OSStatus {status})"));
-        }
-        // SAFETY: both refs are valid.
-        let status = unsafe { SecCodeCheckValidity(code.0, kSecCSStrictValidate, req) };
-        // SAFETY: ours (+1), released once.
-        unsafe { CFRelease(req.cast()) };
+        let status = validity(code, Some(requirement))?;
         if status != 0 {
             return Err(format!("its code is not Apple-anchored and strictly valid (OSStatus {status})"));
         }
@@ -488,6 +611,45 @@ mod macos {
 
 #[cfg(test)]
 mod tests {
+    /// G m/15989: the signer is decided by requirement, a team id believed only under the generic anchor.
+    #[test]
+    fn a_signer_is_decided_by_requirement_never_by_a_field_alone() {
+        use super::{Signer, signer};
+        assert_eq!(signer(true, true, None), Signer::Apple, "anchor apple: a platform binary");
+        assert_eq!(signer(true, true, Some("X".into())), Signer::Apple, "anchor apple wins over a team field");
+        assert_eq!(signer(false, true, Some("P9DJA3JCKP".into())), Signer::Team("P9DJA3JCKP".into()));
+        assert_eq!(signer(false, false, Some("P9DJA3JCKP".into())), Signer::AdHoc, "a team field under no anchor");
+        assert_eq!(signer(false, true, None), Signer::AdHoc, "the generic anchor naming no team");
+        assert_eq!(signer(false, true, Some(String::new())), Signer::AdHoc, "an empty team");
+        assert_eq!(signer(false, false, None), Signer::AdHoc);
+    }
+
+    /// G m/15989: a spawned Apple binary reads as Apple by its identifier; once it has exited, its pid is Err, never
+    /// another process's identity.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_running_apple_binary_reads_as_apple_and_an_exited_pid_is_err() {
+        use super::{Signer, code_of_pid};
+        let mut sleep = std::process::Command::new("/bin/sleep").arg("30").spawn().expect("spawn sleep");
+        let pid = i32::try_from(sleep.id()).expect("a pid");
+        let read = code_of_pid(pid);
+        drop(sleep.kill());
+        drop(sleep.wait());
+        let read = read.expect("sleep's code identity");
+        assert_eq!((read.identifier.as_str(), read.signer), ("com.apple.sleep", Signer::Apple));
+        assert!(code_of_pid(pid).is_err(), "an exited pid is Err");
+    }
+
+    /// This test process reads too: its own identifier, signed ad hoc by the linker, never Apple or a team.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn this_test_process_reads_as_ad_hoc() {
+        let me = i32::try_from(std::process::id()).expect("a pid");
+        let read = super::code_of_pid(me).expect("this process's code identity");
+        assert!(!read.identifier.is_empty());
+        assert_eq!(read.signer, super::Signer::AdHoc, "{read:?}");
+    }
+
     /// (D, 2026-11-06) a verdict is checked once per process: a verified identity and a refusal the
     /// signature gives are cached per audit token; a transient failure is never cached; another token
     /// is another check; a stale verdict is checked again; and the cache keeps to its cap.

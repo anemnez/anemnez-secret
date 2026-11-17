@@ -89,6 +89,11 @@ spoken_for("a-caller-is-known-by-its-code-signature", {
 	"identity::tests::a_peers_audit_token_is_the_kernels_32_bytes_naming_that_process",
 	"identity::tests::a_process_knows_its_own_identity_by_the_same_check",
 })
+spoken_for("a-processs-code-identity-is-read-from-its-audit-token", {
+	"identity::tests::a_signer_is_decided_by_requirement_never_by_a_field_alone",
+	"identity::tests::a_running_apple_binary_reads_as_apple_and_an_exited_pid_is_err",
+	"identity::tests::this_test_process_reads_as_ad_hoc",
+})
 spoken_for("a-held-key-is-read-only-by-its-owning-build", {
 	"custody::tests::an_item_holds_what_was_put_under_it",
 	"custody::tests::errors_never_say_the_value_and_locked_is_not_not_held",
