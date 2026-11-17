@@ -17,6 +17,10 @@
       "value": 0.0,
       "direction": "lower_is_better"
     },
+    "rust.loopback.tests": {
+      "value": 0.0,
+      "direction": "lower_is_better"
+    },
     "rust.unwrap.production": {
       "value": 0.0,
       "direction": "lower_is_better"
