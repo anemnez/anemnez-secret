@@ -112,7 +112,8 @@ Only then does it read the signing identifier and decide the [`Signer`] by requi
 `AdHoc` for anything else that is valid. Unlike `of_peer`, it judges no hardened runtime and trusts no team: it says
 who signed a process, and the caller decides (a consent surface is refused, never admitted, by what it finds). A
 process that is gone, isn't this user's to name, or isn't valid is Err, and a caller that guards with it refuses.
-It blocks, as `of_peer` does.
+It blocks, as `of_peer` does. The identity carries the process it was read from (its `Token`: pid and pidversion,
+from the same audit token), so a caller holds that same process from the read to its act (G m/16009).
 
 ## 4. The owner is proven, never assumed
 
