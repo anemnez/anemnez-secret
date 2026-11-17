@@ -25,6 +25,16 @@
 proofs   = ["proofs"]           # directory-name patterns; your proof suites live in the open
 packages = ".prova/packages"    # this project's own packages; `require("<dir>")` reaches each one
 
+# Every process a proof spawns sees the run's own config and Fabric roots and its own identity, never the
+# host's (house rule 10; standards prova-suite/isolated).
+[isolation]
+env = { XDG_CONFIG_HOME = "{run}/xdg", ANEMNEZ_FABRIC_ROOT = "{run}/fabric", GIT_AUTHOR_NAME = "prova", GIT_AUTHOR_EMAIL = "prova@anemnez.invalid", GIT_COMMITTER_NAME = "prova", GIT_COMMITTER_EMAIL = "prova@anemnez.invalid", JJ_USER = "prova", JJ_EMAIL = "prova@anemnez.invalid" }
+
+# Where the claims the proofs cover live, so each `covers` resolves (standards prova-suite/specs-declared).
+[[specs.source]]
+type = "directory"
+path = "docs/specs"
+
 # The cargo-based quality gates (clippy, the unwrap/expect census, duplication, file sizes under
 # proofs/quality/) recompile or rescan the workspace, so they never run because a person typed
 # `prova` — they sit behind the `quality` switch. This profile scopes to the proofs/quality/ dir
