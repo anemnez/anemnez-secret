@@ -224,11 +224,30 @@ pub fn audit_token(socket: std::os::fd::BorrowedFd<'_>) -> Result<Vec<u8>, Strin
     Ok(audit_token_words(socket)?.iter().flat_map(|w| w.to_ne_bytes()).collect())
 }
 
-/// A process, exactly: its pid and the version of that pid (a pid reused, or an exec, is another version).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// A process, exactly: its pid and the version of that pid (a pid reused, or an exec, is another version). It
+/// carries the whole audit token it was read from (`words`), so a reader hands on the one read, never a token
+/// rebuilt from the pair (M m/19189: anemnez-extension's `Peer.token`, for Agora's `WhoIs`); the word layout stays
+/// this crate's. Two tokens are the same process when their pid and pidversion agree: `words` is what that read
+/// returned, never part of which process it is.
+#[derive(Clone, Copy, Debug)]
 pub struct Token {
     pub pid: i32,
     pub pidversion: i32,
+    pub words: [u32; 8],
+}
+
+impl PartialEq for Token {
+    fn eq(&self, other: &Self) -> bool {
+        (self.pid, self.pidversion) == (other.pid, other.pidversion)
+    }
+}
+
+impl Eq for Token {}
+
+impl std::hash::Hash for Token {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        (self.pid, self.pidversion).hash(state);
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -242,7 +261,7 @@ impl Token {
     fn from_words(t: &[u32; 8]) -> Option<Self> {
         // audit_token_to_euid, _pid and _pidversion (bsm/libbsm.h): words 1, 5 and 7.
         // SAFETY: geteuid has no preconditions.
-        (t[1] == unsafe { libc::geteuid() }).then(|| Self { pid: t[5] as i32, pidversion: t[7] as i32 })
+        (t[1] == unsafe { libc::geteuid() }).then(|| Self { pid: t[5] as i32, pidversion: t[7] as i32, words: *t })
     }
 }
 
@@ -348,7 +367,7 @@ pub fn code_of_pid(pid: i32) -> Result<CodeIdentity, String> {
     let code = macos::guest_by_audit(&token)?;
     let (identifier, apple, generic, team) = macos::code_identity(&code)?;
     // audit_token_to_pidversion: word 7, from the same token.
-    let process = Token { pid, pidversion: words[7] as i32 };
+    let process = Token { pid, pidversion: words[7] as i32, words };
     Ok(CodeIdentity { identifier, signer: signer(apple, generic, team), process })
 }
 
@@ -824,6 +843,25 @@ mod tests {
         assert_eq!((words[5] as i32, words[7] as i32), (me.pid, me.pidversion));
         // SAFETY: geteuid has no preconditions.
         assert_eq!(words[1], unsafe { libc::geteuid() }, "word 1 is the effective user");
+    }
+
+    /// A token carries the whole audit token it was read from, so a reader hands on that one read, never a token
+    /// rebuilt from its pid and pidversion (M m/19189); which process it is stays its pid and pidversion alone.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_peers_token_carries_the_words_it_was_read_from() {
+        use std::os::fd::AsFd;
+        let (a, _b) = std::os::unix::net::UnixStream::pair().expect("a pair");
+        let me = peer(a.as_fd()).expect("its peer");
+        let words = audit_token_words(a.as_fd()).expect("its whole token");
+        assert_eq!(me.words, words, "the read's own words");
+        assert_ne!(me.words[1], 0, "never a rebuilt token with the user left zero");
+        let rebuilt = Token { words: [0; 8], ..me };
+        assert_eq!(rebuilt, me, "the same process, whatever words it carries");
+        let code = code_of_pid(me.pid).map(|c| c.process.words);
+        if let Ok(read) = code {
+            assert_eq!(read[5], words[5], "code_of_pid's token carries its own read too");
+        }
     }
 
     /// A child that connects for itself is its own token, never its parent's; once it is gone its
