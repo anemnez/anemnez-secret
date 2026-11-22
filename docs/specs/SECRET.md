@@ -77,6 +77,9 @@ never travels (LADON §3). `signer::adopt(keychain, item, made_by)` answers the 
   only the public half, and nothing exports its bytes.
 - The service, the account and the requirement are the caller's. `<signer>@<node id>` is the default
   account shape, so two hosts hold two keys.
+- **The requirement has one read:** `identity::own_requirement()`, this build's designated requirement as
+  `codesign -d -r-` prints it, read through the Security framework from the running code (strictly valid first),
+  so no product runs `codesign` for its `made_by` or keeps its own copy of that read (rule 2; D m/24044).
 
 ## 3. Identity: one place a code signature is judged
 

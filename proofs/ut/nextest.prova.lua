@@ -121,4 +121,5 @@ spoken_for("a-signing-key-is-made-on-its-host-and-held-by-its-build", {
 	"signer::tests::two_node_ids_hold_two_keys",
 	"signer::tests::a_key_never_prints_its_value",
 	"signer::tests::an_item_that_isnt_a_key_is_refused_by_name",
+	"identity::tests::a_process_reads_its_own_designated_requirement",
 })
