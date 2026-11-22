@@ -95,6 +95,11 @@ pub fn own() -> Result<Identity, String> {
     Err("this OS has no code signatures to read".to_owned())
 }
 
+/// The house's team: the one Apple team every Anemnez build is signed by, as its runtime home (rule 2; D m/24146).
+/// A build judging itself can't read "my team" from its own signature and call that trust (circular), so a check
+/// that means "our team" compares against this. Each repo's signing `TEAM_ID` and its default trust read it.
+pub const ANEMNEZ_TEAM: &str = "P9DJA3JCKP";
+
 /// This process's own designated requirement, as text (`codesign -d -r-`'s `designated =>` line): what a key this
 /// build makes in custody admits (`signer::adopt`'s `made_by`). Read through the Security framework from the running
 /// code (`SecCodeCopySelf`, strictly valid first, then `SecCodeCopyDesignatedRequirement`), so no product runs
@@ -440,6 +445,12 @@ impl TrustTable {
     /// Anemnez-managed apps only). Where the team comes from (a host's trust policy) is the caller's.
     pub fn anemnez(team: &str) -> Self {
         Self::new(vec![Trusted::Anemnez { team: team.to_owned() }])
+    }
+
+    /// The house's own trust: the Anemnez rule for [`ANEMNEZ_TEAM`], never a team read from the caller's own
+    /// signature.
+    pub fn house() -> Self {
+        Self::anemnez(ANEMNEZ_TEAM)
     }
 
     pub fn entries(&self) -> &[Trusted] {
@@ -888,6 +899,22 @@ mod tests {
             .find_map(|l| l.trim().trim_start_matches("# ").strip_prefix("designated => ").map(str::to_owned))
             .expect("codesign names a designated requirement");
         assert_eq!(mine, theirs, "the same text codesign prints");
+    }
+
+    /// D m/24146: ANEMNEZ_TEAM is the house's real signer. A placed, team-signed build on this host (any instance
+    /// Fabric placed, named by ANEMNEZ_SIGNED_BINARY) is strictly valid, Apple-anchored and signed by exactly this team,
+    /// so if the house's team ever changes this goes red first. By hand, where a signed build exists: the gate's own
+    /// test binaries are ad hoc, and a proof never reads the host's live Fabric.
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "reads a placed, team-signed binary: run by hand with ANEMNEZ_SIGNED_BINARY set"]
+    fn the_house_team_is_the_team_that_signs_a_placed_build() {
+        let binary = std::env::var("ANEMNEZ_SIGNED_BINARY").expect("ANEMNEZ_SIGNED_BINARY names a placed binary");
+        let out = std::process::Command::new("/usr/bin/codesign").args(["-dv", &binary]).output().expect("codesign");
+        let said = String::from_utf8_lossy(&out.stderr);
+        let team = said.lines().find_map(|l| l.strip_prefix("TeamIdentifier=")).expect("a team-signed binary");
+        assert_eq!(team, ANEMNEZ_TEAM, "the house's team signs its placed builds");
+        assert_eq!(TrustTable::house().entries(), TrustTable::anemnez(ANEMNEZ_TEAM).entries());
     }
 
     /// The token a daemon hands Agora's WhoIs: the kernel's 32 bytes, naming the process at the other

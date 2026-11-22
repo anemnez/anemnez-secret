@@ -80,6 +80,9 @@ never travels (LADON §3). `signer::adopt(keychain, item, made_by)` answers the 
 - **The requirement has one read:** `identity::own_requirement()`, this build's designated requirement as
   `codesign -d -r-` prints it, read through the Security framework from the running code (strictly valid first),
   so no product runs `codesign` for its `made_by` or keeps its own copy of that read (rule 2; D m/24044).
+- **The house's team has one runtime home:** `identity::ANEMNEZ_TEAM` (`TrustTable::house()` over it), so a build
+  judging itself compares against our team, never the team its own signature names (circular; D m/24146). A by-hand
+  row ties it to the team that signs a placed build.
 
 ## 3. Identity: one place a code signature is judged
 
