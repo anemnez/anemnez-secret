@@ -95,6 +95,23 @@ pub fn own() -> Result<Identity, String> {
     Err("this OS has no code signatures to read".to_owned())
 }
 
+/// This process's own designated requirement, as text (`codesign -d -r-`'s `designated =>` line): what a key this
+/// build makes in custody admits (`signer::adopt`'s `made_by`). Read through the Security framework from the running
+/// code (`SecCodeCopySelf`, strictly valid first, then `SecCodeCopyDesignatedRequirement`), so no product runs
+/// `codesign` for it or keeps a copy of this read (rule 2). BLOCKS, possibly for seconds: never on an async worker.
+///
+/// # Errors
+/// The running code can't be found, isn't strictly valid, or names no requirement, by OSStatus.
+#[cfg(target_os = "macos")]
+pub fn own_requirement() -> Result<String, String> {
+    macos::designated_requirement(&macos::guest_self()?)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn own_requirement() -> Result<String, String> {
+    Err("this OS has no code signatures to read".to_owned())
+}
+
 /// Refusals that come from the signature itself, so they hold for the life of the process and may be
 /// cached. Anything else (a token that cannot be read, a process gone, an OS error) is transient.
 const LASTING: [&str; 5] = [
@@ -477,9 +494,47 @@ mod macos {
         SecRequirementRef, kSecCSStrictValidate, kSecGuestAttributeAudit,
     };
 
-    // Security.framework, not in security-framework-sys: the signing information of a (running) code.
+    // Security.framework, not in security-framework-sys: the signing information of a (running) code, its designated
+    // requirement, and a requirement's text.
     unsafe extern "C" {
         fn SecCodeCopySigningInformation(code: CFTypeRef, flags: u32, information: *mut CFDictionaryRef) -> i32;
+        fn SecCodeCopyDesignatedRequirement(code: CFTypeRef, flags: u32, requirement: *mut SecRequirementRef) -> i32;
+        fn SecRequirementCopyString(
+            requirement: SecRequirementRef,
+            flags: u32,
+            text: *mut core_foundation::string::CFStringRef,
+        ) -> i32;
+    }
+
+    /// `code`'s designated requirement, as text: strictly valid first (no requirement, no flag loosened), and nothing
+    /// read from its signature before that passes.
+    pub(super) fn designated_requirement(code: &Code) -> Result<String, String> {
+        let status = validity(code, None)?;
+        if status != 0 {
+            return Err(format!("its code is not strictly valid (OSStatus {status})"));
+        }
+        let mut requirement: SecRequirementRef = std::ptr::null_mut();
+        // SAFETY: a valid code ref (a SecCode is accepted where a SecStaticCode is); `requirement` is +1 on success.
+        let status = unsafe { SecCodeCopyDesignatedRequirement(code.0.cast(), 0, &mut requirement) };
+        if status != 0 || requirement.is_null() {
+            return Err(format!("its designated requirement cannot be read (OSStatus {status})"));
+        }
+        let mut text: core_foundation::string::CFStringRef = std::ptr::null();
+        // SAFETY: a valid +1 requirement; `text` is +1 on success.
+        let status = unsafe { SecRequirementCopyString(requirement, 0, &mut text) };
+        // SAFETY: ours (+1), released once.
+        unsafe { CFRelease(requirement.cast()) };
+        if status != 0 || text.is_null() {
+            return Err(format!("its designated requirement has no text (OSStatus {status})"));
+        }
+        // SAFETY: a +1 string, owned from here.
+        Ok(unsafe { CFString::wrap_under_create_rule(text) }.to_string())
+    }
+
+    /// Whether this process's running code satisfies `requirement`: for the requirement read's own row.
+    #[cfg(test)]
+    pub(super) fn self_satisfies(requirement: &str) -> Result<bool, String> {
+        satisfies(&guest_self()?, requirement)
     }
     /// kSecCSSigningInformation | kSecCSRequirementInformation | kSecCSDynamicInformation.
     const INFORMATION: u32 = (1 << 1) | (1 << 2) | (1 << 3);
@@ -813,6 +868,26 @@ mod tests {
     fn a_process_knows_its_own_identity_by_the_same_check() {
         let mine = own().expect_err("an ad hoc test binary");
         assert!(mine.contains("not Apple-anchored"), "{mine}");
+    }
+
+    /// `own_requirement()` is this build's designated requirement: the running process satisfies it, and it is the
+    /// text `codesign -d -r-` names for the same binary, so a key made under it (custody's `made_by`) matches what a
+    /// product that read it through `codesign` wrote before this read had its home here.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_process_reads_its_own_designated_requirement() {
+        let mine = own_requirement().expect("an ad hoc test binary still has a designated requirement");
+        assert!(!mine.is_empty());
+        assert_eq!(macos::self_satisfies(&mine), Ok(true), "this process satisfies its own requirement");
+        let me = std::env::current_exe().expect("this binary");
+        let out =
+            std::process::Command::new("/usr/bin/codesign").args(["-d", "-r-"]).arg(&me).output().expect("codesign");
+        let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        let theirs = said
+            .lines()
+            .find_map(|l| l.trim().trim_start_matches("# ").strip_prefix("designated => ").map(str::to_owned))
+            .expect("codesign names a designated requirement");
+        assert_eq!(mine, theirs, "the same text codesign prints");
     }
 
     /// The token a daemon hands Agora's WhoIs: the kernel's 32 bytes, naming the process at the other
