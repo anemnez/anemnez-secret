@@ -409,6 +409,44 @@ pub fn code_of_pid(_: i32) -> Result<CodeIdentity, String> {
     Err("code identity is read only on macOS".to_owned())
 }
 
+/// A code file's identity, read from its signature on disk: its signing identifier and who signed it. No process is
+/// named, since none runs it yet.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct FileIdentity {
+    pub identifier: String,
+    pub signer: Signer,
+}
+
+/// The code identity of the file at `path`, read as [`code_of_pid`] reads a running process's (B, D direct 11-23): its
+/// static code validated strictly with no flag loosened, every architecture and any nested code included
+/// (`kSecCSStrictValidate | kSecCSCheckAllArchitectures | kSecCSCheckNestedCode`), and its [`Signer`] decided by
+/// requirement. Nothing is read from its signature before that passes. Err when there is no file, when it isn't code,
+/// or when its signature doesn't hold, so a caller that guards with it refuses on Err, the safe direction.
+///
+/// A path names whatever is there when it's read. A caller that then runs the file reads a copy it alone can write
+/// (a 0700 directory of its own), then runs that same copy and checks the running child with [`code_of_pid`], never
+/// the original path, which may change between the check and its use.
+/// BLOCKS, possibly for seconds on a large binary: never on an async worker (see the module docs).
+///
+/// # Errors
+/// Why the code identity couldn't be read, in words.
+#[cfg(target_os = "macos")]
+pub fn code_of_path(path: &std::path::Path) -> Result<FileIdentity, String> {
+    let code = macos::static_at(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let (identifier, apple, generic, team) =
+        macos::code_identity(&code).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(FileIdentity { identifier, signer: signer(apple, generic, team) })
+}
+
+/// Off macOS there is no code identity to read.
+///
+/// # Errors
+/// Always.
+#[cfg(not(target_os = "macos"))]
+pub fn code_of_path(_: &std::path::Path) -> Result<FileIdentity, String> {
+    Err("code identity is read only on macOS".to_owned())
+}
+
 /// The pid in a local socket's peer's audit token (its sixth word), read live (see [`audit_token_words`]):
 /// the process using the socket now, so a holder can require the one child it started (retrust).
 #[cfg(target_os = "macos")]
@@ -509,7 +547,8 @@ mod macos {
     use core_foundation::string::CFString;
     use security_framework_sys::code_signing::{
         SecCodeCheckValidity, SecCodeCopyGuestWithAttributes, SecCodeRef, SecRequirementCreateWithString,
-        SecRequirementRef, kSecCSStrictValidate, kSecGuestAttributeAudit,
+        SecRequirementRef, SecStaticCodeCheckValidity, SecStaticCodeCreateWithPath, SecStaticCodeRef,
+        kSecCSCheckAllArchitectures, kSecCSCheckNestedCode, kSecCSStrictValidate, kSecGuestAttributeAudit,
     };
 
     // Security.framework, not in security-framework-sys: the signing information of a (running) code, its designated
@@ -557,8 +596,17 @@ mod macos {
     /// kSecCSSigningInformation | kSecCSRequirementInformation | kSecCSDynamicInformation.
     const INFORMATION: u32 = (1 << 1) | (1 << 2) | (1 << 3);
 
-    /// A running code, owned (+1), released on drop.
-    pub(super) struct Code(SecCodeRef);
+    /// A code, running or on disk, owned (+1), released on drop.
+    pub(super) struct Code(SecCodeRef, Kind);
+
+    /// Which a [`Code`] is, so it's validated by the call for its kind.
+    #[derive(Clone, Copy)]
+    pub(super) enum Kind {
+        /// A running code (a `SecCode`).
+        Running,
+        /// A file's static code (a `SecStaticCode`).
+        File,
+    }
 
     impl Drop for Code {
         fn drop(&mut self) {
@@ -576,7 +624,7 @@ mod macos {
         if status != 0 || code.is_null() {
             return Err(format!("its running code cannot be found (OSStatus {status})"));
         }
-        Ok(Code(code))
+        Ok(Code(code, Kind::Running))
     }
 
     /// This process's own running code.
@@ -587,7 +635,19 @@ mod macos {
         if status != 0 || code.is_null() {
             return Err(format!("its own running code cannot be found (OSStatus {status})"));
         }
-        Ok(Code(code))
+        Ok(Code(code, Kind::Running))
+    }
+
+    /// The static code of the file at `path`: the file read when it's validated, not when this returns.
+    pub(super) fn static_at(path: &std::path::Path) -> Result<Code, String> {
+        let url = core_foundation::url::CFURL::from_path(path, false).ok_or("its path is not a file URL")?;
+        let mut code: SecStaticCodeRef = std::ptr::null_mut();
+        // SAFETY: a valid file URL and default flags; `code` is +1 on success.
+        let status = unsafe { SecStaticCodeCreateWithPath(url.as_concrete_TypeRef(), 0, &mut code) };
+        if status != 0 || code.is_null() {
+            return Err(format!("it is not code that can be read (OSStatus {status})"));
+        }
+        Ok(Code(code.cast(), Kind::File))
     }
 
     /// The running code an audit token names.
@@ -618,8 +678,19 @@ mod macos {
                 return Err(format!("the requirement does not parse (OSStatus {status})"));
             }
         }
-        // SAFETY: a valid code ref; `req` is valid or null (validity alone).
-        let status = unsafe { SecCodeCheckValidity(code.0, kSecCSStrictValidate, req) };
+        let status = match code.1 {
+            // SAFETY: a valid running code ref; `req` is valid or null (validity alone).
+            Kind::Running => unsafe { SecCodeCheckValidity(code.0, kSecCSStrictValidate, req) },
+            // A file is checked whole: every architecture it carries and any code nested in it, none skipped.
+            // SAFETY: a valid static code ref; `req` is valid or null (validity alone).
+            Kind::File => unsafe {
+                SecStaticCodeCheckValidity(
+                    code.0.cast(),
+                    kSecCSStrictValidate | kSecCSCheckAllArchitectures | kSecCSCheckNestedCode,
+                    req,
+                )
+            },
+        };
         if !req.is_null() {
             // SAFETY: ours (+1), released once.
             unsafe { CFRelease(req.cast()) };
@@ -736,6 +807,48 @@ mod tests {
         assert_eq!(read.process.pid, pid, "the process read is the one asked");
         assert_eq!((read.identifier.as_str(), read.signer), ("com.apple.sleep", Signer::Apple));
         assert!(code_of_pid(pid).is_err(), "an exited pid is Err");
+    }
+
+    /// A file's identity is its signature's (B, D direct 11-23): an Apple binary reads as Apple, and so does its copy,
+    /// byte for byte, in a directory of the test's own, since the signature travels with the bytes and not the path.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_files_code_identity_is_its_signatures_and_a_copy_keeps_it() {
+        use super::{FileIdentity, Signer, code_of_path};
+        let apple = FileIdentity { identifier: "com.apple.sleep".into(), signer: Signer::Apple };
+        assert_eq!(code_of_path(std::path::Path::new("/bin/sleep")), Ok(apple.clone()));
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let copy = dir.path().join("sleep");
+        std::fs::copy("/bin/sleep", &copy).expect("copy sleep");
+        assert_eq!(code_of_path(&copy), Ok(apple), "the copy proves as the original");
+    }
+
+    /// A copy whose bytes changed is no identity, and neither is a file that isn't code or a path with nothing there:
+    /// each is Err, the direction a guard refuses on.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_changed_copy_a_non_code_file_and_a_missing_path_are_err() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let changed = dir.path().join("sleep");
+        let mut bytes = std::fs::read("/bin/sleep").expect("read sleep");
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0xff;
+        std::fs::write(&changed, &bytes).expect("write the changed copy");
+        assert!(super::code_of_path(&changed).is_err(), "a changed byte breaks the signature");
+        let text = dir.path().join("note.txt");
+        std::fs::write(&text, "not code").expect("write a text file");
+        assert!(super::code_of_path(&text).is_err(), "a text file is not code");
+        assert!(super::code_of_path(&dir.path().join("absent")).is_err(), "nothing there is Err");
+    }
+
+    /// This test binary on disk reads as the linker signed it: ad hoc, never Apple or a team.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn this_test_binary_on_disk_reads_as_ad_hoc() {
+        let me = std::env::current_exe().expect("this test binary's path");
+        let read = super::code_of_path(&me).expect("its code identity");
+        assert!(!read.identifier.is_empty());
+        assert_eq!(read.signer, super::Signer::AdHoc, "{read:?}");
     }
 
     /// This test process reads too: its own identifier, signed ad hoc by the linker, never Apple or a team.
