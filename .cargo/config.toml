@@ -1,6 +1,7 @@
-# Artichoke, the Anemnez registry (artichoke docs/specs/REGISTRY.md §11): this machine's, on loopback. anemnez-secret
-# takes its one Anemnez dependency, anemnez-clock, from it by version (house rule 3: time is handed in). The read
-# token is `[registries.artichoke] token` in ~/.cargo/credentials.toml, or the macOS keychain, per host.
+# Artichoke, the Anemnez registry (artichoke docs/specs/REGISTRY.md §11), as every release-chain crate carries it
+# (anemnez-layout, anemnez-vcs): a git build of anemnez-secret resolves anemnez-clock by git and needs none of this;
+# packaging and publishing resolve its registry-index, which reads the read token from ~/.cargo/credentials.toml or the
+# macOS keychain, per host.
 [registries.artichoke]
 index = "sparse+http://127.0.0.1:7787/crates/index/"
 

@@ -9,7 +9,9 @@ publish.workspace = true
 
 [dependencies]
 # Time is handed in, never reached for (house rule 3): the verdict cache and retrust's bounds read the host's Clock.
-anemnez-clock = { version = "0.1.31", registry = "artichoke" }
+# Dual form, as every release-chain crate takes it (E m/25990): fabric builds secret by git while Artichoke may be
+# down, at fabric's own clock rev, so the two unify; a publish names the registry.
+anemnez-clock = { git = "ssh://git@github.com/anemnez/anemnez-clock.git", rev = "3ed93558f1b7", version = "0.1", registry-index = "sparse+http://127.0.0.1:7787/crates/index/" }
 # retrust: a private directory for the socket a successor connects to.
 tempfile = "3"
 sha2 = "0.10"
