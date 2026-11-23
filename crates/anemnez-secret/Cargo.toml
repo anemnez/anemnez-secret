@@ -12,7 +12,7 @@ publish.workspace = true
 # Dual form, as every release-chain crate takes it (E m/25990): a git build resolves it by git while Artichoke may be
 # down, and a publish names the registry. At the family's settled clock, 66a972f441f2 (M m/25606, m/26302), which the
 # SDK takes and fabric, artichoke and herald each take at their own family move.
-anemnez-clock = { git = "ssh://git@github.com/anemnez/anemnez-clock.git", rev = "73a16e1d1d17", version = "0.1", registry-index = "sparse+http://127.0.0.1:7787/crates/index/" }
+anemnez-clock = { git = "ssh://git@github.com/anemnez/anemnez-clock.git", rev = "ce82b23c2323", version = "0.1", registry-index = "sparse+http://127.0.0.1:7787/crates/index/" }
 # retrust: a private directory for the socket a successor connects to.
 tempfile = "3"
 sha2 = "0.10"
