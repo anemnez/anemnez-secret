@@ -123,23 +123,7 @@ pub type Identify<'a> = &'a dyn Fn(&UnixStream) -> Result<Identity, String>;
 /// The holder's side: hand `item` to the successor at `program`, started with `args` and
 /// [`SOCKET_ENV`] naming the socket, which must answer as `expected`. `own` is this build's identity
 /// ([`crate::identity::own`]).
-#[allow(clippy::too_many_arguments)]
-#[deprecated(note = "hand the host's clock in: retrust::to_on(clock, ..) (house rule 3)")]
-pub fn to(
-    keychain: &Keychain,
-    item: &Item,
-    program: &Path,
-    args: &[String],
-    expected: &str,
-    own: &Identity,
-    owner: &dyn OwnerCheck,
-    identify: Identify<'_>,
-) -> Result<(), String> {
-    to_on(&anemnez_clock::Clock::system(), keychain, item, program, args, expected, own, owner, identify)
-}
-
-/// [`to`] on `clock`, the host's one clock (house rule 3): the successor's connect and each step are bounded on it.
-/// Artichoke's retrust moves onto this in its next head, and then `to` goes (E m/25965, D m/25968).
+/// On `clock`, the host's one clock (house rule 3): the successor's connect and each step are bounded on it.
 #[allow(clippy::too_many_arguments)]
 pub fn to_on(
     clock: &anemnez_clock::Clock,

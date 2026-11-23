@@ -161,14 +161,6 @@ impl Verdicts {
         Self { clock, ttl, refused_ttl, cap, held: std::sync::Mutex::default() }
     }
 
-    /// [`Verdicts::on`] the system clock, for a caller not yet handing its own in: fabricd's writers guard and
-    /// Agora's sessions, each moving to `on` in its next head. Then this goes (E m/25965, D m/25968).
-    #[deprecated(note = "hand the host's clock in: Verdicts::on(clock, ttl, refused_ttl, cap) (house rule 3)")]
-    #[must_use]
-    pub fn new(ttl: std::time::Duration, refused_ttl: std::time::Duration, cap: usize) -> Self {
-        Self::on(anemnez_clock::Clock::system(), ttl, refused_ttl, cap)
-    }
-
     /// The verdict for `token`: the cached one while it is fresh, else `check`'s, cached when it is
     /// lasting.
     pub fn get_or_check(
