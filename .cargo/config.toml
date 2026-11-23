@@ -1,0 +1,8 @@
+# Artichoke, the Anemnez registry (artichoke docs/specs/REGISTRY.md §11): this machine's, on loopback. anemnez-secret
+# takes its one Anemnez dependency, anemnez-clock, from it by version (house rule 3: time is handed in). The read
+# token is `[registries.artichoke] token` in ~/.cargo/credentials.toml, or the macOS keychain, per host.
+[registries.artichoke]
+index = "sparse+http://127.0.0.1:7787/crates/index/"
+
+[registry]
+global-credential-providers = ["cargo:token", "cargo:macos-keychain"]

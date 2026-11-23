@@ -3,9 +3,20 @@
 version = 4
 
 [[package]]
+name = "anemnez-clock"
+version = "0.1.32+66a972f441f2"
+source = "sparse+http://127.0.0.1:7787/crates/index/"
+checksum = "3df545eecd9dfeff76ef2bf3e8912e500411f9a66c34f9c0c4907eccdcd8a0b9"
+dependencies = [
+ "libc",
+ "tokio",
+]
+
+[[package]]
 name = "anemnez-secret"
 version = "0.1.0"
 dependencies = [
+ "anemnez-clock",
  "block2",
  "core-foundation",
  "ed25519-dalek",
@@ -18,6 +29,7 @@ dependencies = [
  "security-framework-sys",
  "sha2",
  "tempfile",
+ "tokio",
  "zeroize",
 ]
 
@@ -315,6 +327,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
+name = "pin-project-lite"
+version = "0.2.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c938015719552d665fd0553b90d96cd7ff58e83e4c061ca99e6bb78865a72752"
+
+[[package]]
 name = "pkcs8"
 version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -506,6 +524,15 @@ dependencies = [
  "once_cell",
  "rustix",
  "windows-sys",
+]
+
+[[package]]
+name = "tokio"
+version = "1.54.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"
+dependencies = [
+ "pin-project-lite",
 ]
 
 [[package]]

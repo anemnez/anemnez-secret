@@ -8,6 +8,8 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+# Time is handed in, never reached for (house rule 3): the verdict cache and retrust's bounds read the host's Clock.
+anemnez-clock = { version = "0.1.31", registry = "artichoke" }
 # retrust: a private directory for the socket a successor connects to.
 tempfile = "3"
 sha2 = "0.10"
@@ -32,4 +34,6 @@ objc2-foundation = "0.3"
 objc2-local-authentication = "0.3"
 
 [dev-dependencies]
+# The verdict row drives a ManualClock, whose advance is async.
+tokio = { version = "1", features = ["rt", "time"] }
 tempfile = "3"

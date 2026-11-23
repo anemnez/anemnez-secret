@@ -92,9 +92,14 @@ impl Successor for Remote {
 /// Accept the one connection that comes from process `pid` (the child the holder spawned, unreaped, so
 /// its pid cannot be reused), within `within`. A connection from any other process, however it is
 /// signed, is refused and dropped, and the wait goes on (D and F, 2026-11-06).
-pub fn accept_from(listener: &UnixListener, pid: i32, within: Duration) -> Result<UnixStream, String> {
+pub fn accept_from(
+    listener: &UnixListener,
+    pid: i32,
+    within: Duration,
+    clock: &anemnez_clock::Clock,
+) -> Result<UnixStream, String> {
     listener.set_nonblocking(true).map_err(|e| e.to_string())?;
-    let deadline = std::time::Instant::now() + within;
+    let deadline = clock.now_mono() + within;
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
@@ -104,8 +109,8 @@ pub fn accept_from(listener: &UnixListener, pid: i32, within: Duration) -> Resul
                 }
                 drop(stream);
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && std::time::Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(20));
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && clock.now_mono() < deadline => {
+                clock.blocking_sleep(Duration::from_millis(20));
             }
             Err(e) => return Err(format!("the successor never connected: {e}")),
         }
@@ -119,7 +124,25 @@ pub type Identify<'a> = &'a dyn Fn(&UnixStream) -> Result<Identity, String>;
 /// [`SOCKET_ENV`] naming the socket, which must answer as `expected`. `own` is this build's identity
 /// ([`crate::identity::own`]).
 #[allow(clippy::too_many_arguments)]
+#[deprecated(note = "hand the host's clock in: retrust::to_on(clock, ..) (house rule 3)")]
 pub fn to(
+    keychain: &Keychain,
+    item: &Item,
+    program: &Path,
+    args: &[String],
+    expected: &str,
+    own: &Identity,
+    owner: &dyn OwnerCheck,
+    identify: Identify<'_>,
+) -> Result<(), String> {
+    to_on(&anemnez_clock::Clock::system(), keychain, item, program, args, expected, own, owner, identify)
+}
+
+/// [`to`] on `clock`, the host's one clock (house rule 3): the successor's connect and each step are bounded on it.
+/// Artichoke's retrust moves onto this in its next head, and then `to` goes (E m/25965, D m/25968).
+#[allow(clippy::too_many_arguments)]
+pub fn to_on(
+    clock: &anemnez_clock::Clock,
     keychain: &Keychain,
     item: &Item,
     program: &Path,
@@ -146,7 +169,7 @@ pub fn to(
         .map_err(|e| format!("the successor {} could not start: {e}", program.display()))?;
     let result = (|| {
         let pid = i32::try_from(child.id()).map_err(|e| e.to_string())?;
-        let stream = accept_from(&listener, pid, STEP)?;
+        let stream = accept_from(&listener, pid, STEP, clock)?;
         // The one connection is taken: nothing else may reach the socket.
         let _ = std::fs::remove_file(&socket);
         stream.set_nonblocking(false).map_err(|e| e.to_string())?;
@@ -192,7 +215,7 @@ pub fn serve(socket: &Path, keychain: &Keychain, item: &Item, made_by: &str) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::{allowed, serve, to};
+    use super::{allowed, serve, to_on};
     use crate::Secret;
     use crate::custody::{Item, Keychain};
     use crate::identity::Identity;
@@ -248,13 +271,16 @@ mod tests {
             .spawn()
             .unwrap();
         let pid = i32::try_from(child.id()).unwrap();
-        let taken = super::accept_from(&listener, pid, std::time::Duration::from_secs(10)).expect("the child's");
+        let taken =
+            super::accept_from(&listener, pid, std::time::Duration::from_secs(10), &anemnez_clock::Clock::system())
+                .expect("the child's");
         assert_eq!(crate::identity::peer_pid(std::os::fd::AsFd::as_fd(&taken)), Ok(pid));
         // A dropped connection reads as closed; macOS may even refuse a timeout on it (EINVAL).
         let _ = first.set_read_timeout(Some(std::time::Duration::from_secs(2)));
         let mut buf = [0u8; 1];
         assert!(first.read(&mut buf).map_or(true, |n| n == 0), "the first connection was dropped");
-        let none = super::accept_from(&listener, 1, std::time::Duration::from_millis(100));
+        let none =
+            super::accept_from(&listener, 1, std::time::Duration::from_millis(100), &anemnez_clock::Clock::system());
         assert!(none.unwrap_err().contains("never connected"));
         drop(child.kill());
         drop(child.wait());
@@ -291,18 +317,32 @@ mod tests {
         let owner = Owner(false, Default::default());
 
         let impostor = |_: &std::os::unix::net::UnixStream| Ok(id("TEAM", "ai.anemnez.other"));
-        let refused = to(&k, &item, &me, &args, "ai.anemnez.exampled", &own, &owner, &impostor).unwrap_err();
+        let refused = to_on(
+            &anemnez_clock::Clock::system(),
+            &k,
+            &item,
+            &me,
+            &args,
+            "ai.anemnez.exampled",
+            &own,
+            &owner,
+            &impostor,
+        )
+        .unwrap_err();
         assert!(refused.contains("not the expected"), "{refused}");
         assert!(k.held(&item).unwrap() && !k.held(&item.next()).unwrap(), "nothing moved");
 
         // The real check: this test binary is ad hoc signed, so it is no identity, and nothing moves.
         let real = |s: &std::os::unix::net::UnixStream| crate::identity::of_peer(std::os::fd::AsFd::as_fd(s));
-        let unsigned = to(&k, &item, &me, &args, "ai.anemnez.exampled", &own, &owner, &real).unwrap_err();
+        let unsigned =
+            to_on(&anemnez_clock::Clock::system(), &k, &item, &me, &args, "ai.anemnez.exampled", &own, &owner, &real)
+                .unwrap_err();
         assert!(!unsigned.contains("ZZZtop"), "{unsigned}");
         assert!(k.held(&item).unwrap() && !k.held(&item.next()).unwrap(), "an unsigned child gets nothing");
 
         let successor = |_: &std::os::unix::net::UnixStream| Ok(id("TEAM", "ai.anemnez.exampled"));
-        to(&k, &item, &me, &args, "ai.anemnez.exampled", &own, &owner, &successor).expect("handed over");
+        to_on(&anemnez_clock::Clock::system(), &k, &item, &me, &args, "ai.anemnez.exampled", &own, &owner, &successor)
+            .expect("handed over");
         assert_eq!(k.get(&item).unwrap().expose(|v| v.to_vec()), VALUE.as_bytes());
         assert!(!k.held(&item.next()).unwrap());
         assert_eq!(k.maker(&item).as_deref(), Some("the child"), "the child's item now");

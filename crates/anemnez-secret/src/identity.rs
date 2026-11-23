@@ -132,11 +132,12 @@ fn lasting(refusal: &str) -> bool {
 }
 
 /// One cached verdict: when it was checked, and what the check said.
-type Held = std::collections::HashMap<Vec<u8>, (std::time::Instant, Result<Identity, String>)>;
+type Held = std::collections::HashMap<Vec<u8>, (anemnez_clock::Mono, Result<Identity, String>)>;
 
-/// Checks per process, keyed by the full audit token (see the module docs). Plain std: the lock is
-/// never held while a check runs.
+/// Checks per process, keyed by the full audit token (see the module docs). The lock is never held while a check
+/// runs. Its time is the handed-in `clock`'s (house rule 3), never read from the process, so a row drives it.
 pub struct Verdicts {
+    clock: anemnez_clock::Clock,
     /// How long a verified identity is kept.
     ttl: std::time::Duration,
     /// How long a refusal is kept: shorter, since a running process can fail strict validity briefly
@@ -148,10 +149,24 @@ pub struct Verdicts {
 }
 
 impl Verdicts {
-    /// A cache that keeps a verified identity for `ttl`, a refusal for `refused_ttl`, and at most `cap`
-    /// verdicts (say 10 min, 60 s and 1024).
+    /// A cache on `clock` that keeps a verified identity for `ttl`, a refusal for `refused_ttl`, and at most `cap`
+    /// verdicts (say 10 min, 60 s and 1024). The host hands in its one clock (house rule 3).
+    #[must_use]
+    pub fn on(
+        clock: anemnez_clock::Clock,
+        ttl: std::time::Duration,
+        refused_ttl: std::time::Duration,
+        cap: usize,
+    ) -> Self {
+        Self { clock, ttl, refused_ttl, cap, held: std::sync::Mutex::default() }
+    }
+
+    /// [`Verdicts::on`] the system clock, for a caller not yet handing its own in: fabricd's writers guard and
+    /// Agora's sessions, each moving to `on` in its next head. Then this goes (E m/25965, D m/25968).
+    #[deprecated(note = "hand the host's clock in: Verdicts::on(clock, ttl, refused_ttl, cap) (house rule 3)")]
+    #[must_use]
     pub fn new(ttl: std::time::Duration, refused_ttl: std::time::Duration, cap: usize) -> Self {
-        Self { ttl, refused_ttl, cap, held: std::sync::Mutex::default() }
+        Self::on(anemnez_clock::Clock::system(), ttl, refused_ttl, cap)
     }
 
     /// The verdict for `token`: the cached one while it is fresh, else `check`'s, cached when it is
@@ -161,7 +176,7 @@ impl Verdicts {
         token: &[u8],
         check: impl FnOnce() -> Result<Identity, String>,
     ) -> Result<Identity, String> {
-        let now = std::time::Instant::now();
+        let now = self.clock.now_mono();
         if let Some((at, verdict)) = self.lock().get(token)
             && self.fresh(verdict, *at, now)
         {
@@ -185,9 +200,9 @@ impl Verdicts {
 
     /// Whether a verdict checked at `at` still holds at `now`: a verified one for `ttl`, a refusal for
     /// the shorter `refused_ttl`.
-    fn fresh(&self, verdict: &Result<Identity, String>, at: std::time::Instant, now: std::time::Instant) -> bool {
+    fn fresh(&self, verdict: &Result<Identity, String>, at: anemnez_clock::Mono, now: anemnez_clock::Mono) -> bool {
         let ttl = if verdict.is_ok() { self.ttl } else { self.refused_ttl };
-        now.duration_since(at) < ttl
+        now.saturating_since(at) < ttl
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Held> {
@@ -742,13 +757,57 @@ mod tests {
         assert_eq!(Some(read.process), super::current(me), "the same process current() names: pid and pidversion");
     }
 
+    /// House rule 3 (E m/25965, D m/25968): the cache's time is its handed-in clock's, so a row drives it with no
+    /// sleep. A verified verdict is served from the cache until just before its ttl and checked again at it; a lasting
+    /// refusal clears at its own, shorter ttl.
+    #[test]
+    fn a_verdicts_age_is_read_on_its_handed_in_clock() {
+        use std::cell::Cell;
+        let manual = anemnez_clock::ManualClock::new();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().expect("a runtime");
+        let v = super::Verdicts::on(
+            manual.clock(),
+            std::time::Duration::from_secs(600),
+            std::time::Duration::from_secs(60),
+            8,
+        );
+        let checks = Cell::new(0);
+        let ok = || {
+            checks.set(checks.get() + 1);
+            Ok(super::Identity { identifier: "ai.anemnez.x".into(), team: "T".into() })
+        };
+        let refused = || {
+            checks.set(checks.get() + 1);
+            Err("its signature names no identifier".to_owned())
+        };
+        let _ = v.get_or_check(b"a", ok);
+        rt.block_on(manual.advance(std::time::Duration::from_secs(599)));
+        let _ = v.get_or_check(b"a", ok);
+        assert_eq!(checks.get(), 1, "fresh until its ttl, by the clock");
+        rt.block_on(manual.advance(std::time::Duration::from_secs(1)));
+        let _ = v.get_or_check(b"a", ok);
+        assert_eq!(checks.get(), 2, "at its ttl it is checked again");
+        let _ = v.get_or_check(b"b", refused);
+        rt.block_on(manual.advance(std::time::Duration::from_secs(59)));
+        let _ = v.get_or_check(b"b", refused);
+        assert_eq!(checks.get(), 3, "a lasting refusal is kept until its own ttl");
+        rt.block_on(manual.advance(std::time::Duration::from_secs(1)));
+        let _ = v.get_or_check(b"b", refused);
+        assert_eq!(checks.get(), 4, "and checked again at it");
+    }
+
     /// (D, 2026-11-06) a verdict is checked once per process: a verified identity and a refusal the
     /// signature gives are cached per audit token; a transient failure is never cached; another token
     /// is another check; a stale verdict is checked again; and the cache keeps to its cap.
     #[test]
     fn a_process_is_checked_once_and_only_lasting_verdicts_are_kept() {
         use std::cell::Cell;
-        let v = super::Verdicts::new(std::time::Duration::from_secs(600), std::time::Duration::from_secs(60), 2);
+        let v = super::Verdicts::on(
+            anemnez_clock::Clock::system(),
+            std::time::Duration::from_secs(600),
+            std::time::Duration::from_secs(60),
+            2,
+        );
         let runs = Cell::new(0);
         let ok = || {
             runs.set(runs.get() + 1);
@@ -772,12 +831,22 @@ mod tests {
         let _ = v.get_or_check(b"tok-c", transient);
         assert_eq!(runs.get(), 4, "a transient failure: never cached");
         assert!(v.lock().len() <= 2, "the cap holds: {}", v.lock().len());
-        let stale = super::Verdicts::new(std::time::Duration::ZERO, std::time::Duration::ZERO, 8);
+        let stale = super::Verdicts::on(
+            anemnez_clock::Clock::system(),
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+            8,
+        );
         let _ = stale.get_or_check(b"tok-d", ok);
         let _ = stale.get_or_check(b"tok-d", ok);
         assert_eq!(runs.get(), 6, "a stale verdict is checked again");
         // D, 2026-11-06: a refusal clears sooner than a verified identity (a binary mid-swap).
-        let short = super::Verdicts::new(std::time::Duration::from_secs(600), std::time::Duration::ZERO, 8);
+        let short = super::Verdicts::on(
+            anemnez_clock::Clock::system(),
+            std::time::Duration::from_secs(600),
+            std::time::Duration::ZERO,
+            8,
+        );
         let _ = short.get_or_check(b"tok-e", ok);
         let _ = short.get_or_check(b"tok-e", ok);
         assert_eq!(runs.get(), 7, "verified: still held");

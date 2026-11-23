@@ -5,3 +5,20 @@
 # too-many-lines-threshold is also 100, so the census works identically whether this file landed
 # or the project's own config won.
 too-many-lines-threshold = 100
+
+# clock bans (project-standards): time is handed in, never reached for (house rule 3). The standards own this list
+# (standards.defaults.clock_bans), and Horai's standards bump rewrites this block to the tag (D m/25968).
+disallowed-methods = [
+  { path = "std::time::Instant::now", reason = "clock: read time through an injected anemnez-clock Clock" },
+  { path = "std::time::SystemTime::now", reason = "clock: read wall time through an injected Clock" },
+  { path = "std::thread::sleep", reason = "clock: wait through an injected Clock" },
+  { path = "tokio::time::sleep", reason = "clock: wait through an injected Clock" },
+  { path = "tokio::time::sleep_until", reason = "clock: wait through an injected Clock" },
+  { path = "tokio::time::interval", reason = "clock: tick through an injected Clock" },
+  { path = "tokio::time::interval_at", reason = "clock: tick through an injected Clock" },
+  { path = "tokio::time::timeout", reason = "clock: bound through an injected Clock" },
+  { path = "tokio::time::timeout_at", reason = "clock: bound through an injected Clock" },
+  { path = "tokio::time::Instant::now", reason = "clock: read time through an injected Clock" },
+  { path = "chrono::Utc::now", reason = "clock: read wall time through an injected Clock" },
+  { path = "chrono::Local::now", reason = "clock: read wall time through an injected Clock" },
+]
