@@ -565,14 +565,14 @@ mod macos {
 
     /// `code`'s designated requirement, as text: strictly valid first (no requirement, no flag loosened), and nothing
     /// read from its signature before that passes.
-    pub(super) fn designated_requirement(code: &Code) -> Result<String, String> {
+    pub(super) fn designated_requirement(code: &impl Signed) -> Result<String, String> {
         let status = validity(code, None)?;
         if status != 0 {
             return Err(format!("its code is not strictly valid (OSStatus {status})"));
         }
         let mut requirement: SecRequirementRef = std::ptr::null_mut();
         // SAFETY: a valid code ref (a SecCode is accepted where a SecStaticCode is); `requirement` is +1 on success.
-        let status = unsafe { SecCodeCopyDesignatedRequirement(code.0.cast(), 0, &mut requirement) };
+        let status = unsafe { SecCodeCopyDesignatedRequirement(code.static_ref().cast(), 0, &mut requirement) };
         if status != 0 || requirement.is_null() {
             return Err(format!("its designated requirement cannot be read (OSStatus {status})"));
         }
@@ -596,16 +596,54 @@ mod macos {
     /// kSecCSSigningInformation | kSecCSRequirementInformation | kSecCSDynamicInformation.
     const INFORMATION: u32 = (1 << 1) | (1 << 2) | (1 << 3);
 
-    /// A code, running or on disk, owned (+1), released on drop.
-    pub(super) struct Code(SecCodeRef, Kind);
+    /// A running code (a `SecCode`), owned (+1), released on drop.
+    pub(super) struct Code(SecCodeRef);
 
-    /// Which a [`Code`] is, so it's validated by the call for its kind.
-    #[derive(Clone, Copy)]
-    pub(super) enum Kind {
-        /// A running code (a `SecCode`).
-        Running,
-        /// A file's static code (a `SecStaticCode`).
-        File,
+    /// A file's static code (a `SecStaticCode`), owned (+1), released on drop. A type of its own, so a question only
+    /// a running code answers (a guest, a pid, dynamic validity) can't be asked of a file: the compiler holds that line.
+    pub(super) struct File(SecStaticCodeRef);
+
+    impl Drop for File {
+        fn drop(&mut self) {
+            // SAFETY: ours (+1), released once.
+            unsafe { CFRelease(self.0.cast()) };
+        }
+    }
+
+    /// What a running code and a file share: their static view (signing information, the designated requirement), and
+    /// strict validity, each by the call for its kind.
+    pub(super) trait Signed {
+        /// The code as a `SecStaticCode`, for the calls that take one: a `SecCode` is accepted where one is.
+        fn static_ref(&self) -> SecStaticCodeRef;
+        /// Strict validity against `req` (null: validity alone), with no flag loosened, as its OSStatus.
+        fn check_validity(&self, req: SecRequirementRef) -> i32;
+    }
+
+    impl Signed for Code {
+        fn static_ref(&self) -> SecStaticCodeRef {
+            self.0.cast()
+        }
+        fn check_validity(&self, req: SecRequirementRef) -> i32 {
+            // SAFETY: a valid running code ref; `req` is valid or null (validity alone).
+            unsafe { SecCodeCheckValidity(self.0, kSecCSStrictValidate, req) }
+        }
+    }
+
+    impl Signed for File {
+        fn static_ref(&self) -> SecStaticCodeRef {
+            self.0
+        }
+        fn check_validity(&self, req: SecRequirementRef) -> i32 {
+            // A file is checked whole: every architecture it carries and any code nested in it, none skipped.
+            // SAFETY: a valid static code ref; `req` is valid or null (validity alone).
+            unsafe {
+                SecStaticCodeCheckValidity(
+                    self.0,
+                    kSecCSStrictValidate | kSecCSCheckAllArchitectures | kSecCSCheckNestedCode,
+                    req,
+                )
+            }
+        }
     }
 
     impl Drop for Code {
@@ -624,7 +662,7 @@ mod macos {
         if status != 0 || code.is_null() {
             return Err(format!("its running code cannot be found (OSStatus {status})"));
         }
-        Ok(Code(code, Kind::Running))
+        Ok(Code(code))
     }
 
     /// This process's own running code.
@@ -635,11 +673,11 @@ mod macos {
         if status != 0 || code.is_null() {
             return Err(format!("its own running code cannot be found (OSStatus {status})"));
         }
-        Ok(Code(code, Kind::Running))
+        Ok(Code(code))
     }
 
     /// The static code of the file at `path`: the file read when it's validated, not when this returns.
-    pub(super) fn static_at(path: &std::path::Path) -> Result<Code, String> {
+    pub(super) fn static_at(path: &std::path::Path) -> Result<File, String> {
         let url = core_foundation::url::CFURL::from_path(path, false).ok_or("its path is not a file URL")?;
         let mut code: SecStaticCodeRef = std::ptr::null_mut();
         // SAFETY: a valid file URL and default flags; `code` is +1 on success.
@@ -647,7 +685,7 @@ mod macos {
         if status != 0 || code.is_null() {
             return Err(format!("it is not code that can be read (OSStatus {status})"));
         }
-        Ok(Code(code.cast(), Kind::File))
+        Ok(File(code))
     }
 
     /// The running code an audit token names.
@@ -668,7 +706,7 @@ mod macos {
 
     /// `SecCodeCheckValidity` with `kSecCSStrictValidate` (no flag loosened) against `requirement`, or validity alone
     /// when `None`: its OSStatus, for each caller to word. Err only when the requirement doesn't parse.
-    fn validity(code: &Code, requirement: Option<&str>) -> Result<i32, String> {
+    fn validity(code: &impl Signed, requirement: Option<&str>) -> Result<i32, String> {
         let mut req: SecRequirementRef = std::ptr::null_mut();
         if let Some(requirement) = requirement {
             let text = CFString::new(requirement);
@@ -678,19 +716,7 @@ mod macos {
                 return Err(format!("the requirement does not parse (OSStatus {status})"));
             }
         }
-        let status = match code.1 {
-            // SAFETY: a valid running code ref; `req` is valid or null (validity alone).
-            Kind::Running => unsafe { SecCodeCheckValidity(code.0, kSecCSStrictValidate, req) },
-            // A file is checked whole: every architecture it carries and any code nested in it, none skipped.
-            // SAFETY: a valid static code ref; `req` is valid or null (validity alone).
-            Kind::File => unsafe {
-                SecStaticCodeCheckValidity(
-                    code.0.cast(),
-                    kSecCSStrictValidate | kSecCSCheckAllArchitectures | kSecCSCheckNestedCode,
-                    req,
-                )
-            },
-        };
+        let status = code.check_validity(req);
         if !req.is_null() {
             // SAFETY: ours (+1), released once.
             unsafe { CFRelease(req.cast()) };
@@ -703,7 +729,7 @@ mod macos {
 
     /// Whether `code` (already strictly valid) satisfies `requirement`: Ok(false) only for errSecCSReqFailed, every
     /// other failure an Err.
-    fn satisfies(code: &Code, requirement: &str) -> Result<bool, String> {
+    fn satisfies(code: &impl Signed, requirement: &str) -> Result<bool, String> {
         match validity(code, Some(requirement))? {
             0 => Ok(true),
             REQ_FAILED => Ok(false),
@@ -714,7 +740,7 @@ mod macos {
     /// A running code's identifier, whether it satisfies `anchor apple` and `anchor apple generic`, and the team id
     /// its signing information names: validated strictly first (no requirement, no flag loosened), and nothing read
     /// from its signature before that passes.
-    pub(super) fn code_identity(code: &Code) -> Result<(String, bool, bool, Option<String>), String> {
+    pub(super) fn code_identity(code: &impl Signed) -> Result<(String, bool, bool, Option<String>), String> {
         let status = validity(code, None)?;
         if status != 0 {
             return Err(format!("its code is not strictly valid (OSStatus {status})"));
@@ -723,7 +749,7 @@ mod macos {
         let generic = satisfies(code, super::APPLE_ANCHORED)?;
         let mut info: CFDictionaryRef = std::ptr::null();
         // SAFETY: a valid code ref (a SecCode is accepted where a SecStaticCode is); `info` is +1 on success.
-        let status = unsafe { SecCodeCopySigningInformation(code.0.cast(), INFORMATION, &mut info) };
+        let status = unsafe { SecCodeCopySigningInformation(code.static_ref().cast(), INFORMATION, &mut info) };
         if status != 0 || info.is_null() {
             return Err(format!("its signing information cannot be read (OSStatus {status})"));
         }
@@ -741,14 +767,14 @@ mod macos {
 
     /// Whether `code` meets `requirement`, validated strictly, and what its signature then says. Nothing is
     /// read from the signature before the check passes.
-    pub(super) fn check(code: &Code, requirement: &str) -> Result<super::Signature, String> {
+    pub(super) fn check(code: &impl Signed, requirement: &str) -> Result<super::Signature, String> {
         let status = validity(code, Some(requirement))?;
         if status != 0 {
             return Err(format!("its code is not Apple-anchored and strictly valid (OSStatus {status})"));
         }
         let mut info: CFDictionaryRef = std::ptr::null();
         // SAFETY: a valid code ref (a SecCode is accepted where a SecStaticCode is); `info` is +1 on success.
-        let status = unsafe { SecCodeCopySigningInformation(code.0.cast(), INFORMATION, &mut info) };
+        let status = unsafe { SecCodeCopySigningInformation(code.static_ref().cast(), INFORMATION, &mut info) };
         if status != 0 || info.is_null() {
             return Err(format!("its signing information cannot be read (OSStatus {status})"));
         }
