@@ -110,6 +110,12 @@ spoken_for("a-key-goes-only-to-a-checked-successor", {
 	"retrust::tests::only_the_spawned_childs_connection_is_taken",
 })
 
+spoken_for("a-key-held-before-custody-is-adopted-never-reminted", {
+	"signer::tests::a_file_only_role_adopts_its_own_key_and_the_file_is_renamed_after",
+	"signer::tests::a_crash_after_the_write_is_finished_by_the_next_run_with_no_new_key",
+	"signer::tests::a_file_and_an_item_that_differ_are_refused_as_forked_and_the_file_is_kept",
+})
+
 spoken_for("a-signing-key-is-made-on-its-host-and-held-by-its-build", {
 	"signer::tests::a_key_is_made_only_when_nothing_is_held_and_no_hand_off_is_pending",
 	"signer::tests::a_key_is_made_once_then_adopted_never_remade",

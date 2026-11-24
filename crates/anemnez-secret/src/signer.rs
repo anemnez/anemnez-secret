@@ -42,8 +42,9 @@ impl fmt::Debug for SigningKey {
     }
 }
 
-/// How [`adopt`] came by the key.
+/// How [`adopt`] or [`adopt_existing`] came by the key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Adopted {
     /// Nothing was held, so it was made here, now.
     Made,
@@ -51,10 +52,14 @@ pub enum Adopted {
     Held,
     /// A hand-off to this build was cut short: its `.next` item was moved into place.
     Finished,
+    /// A key this product held before custody (a file) was written into its item and read back equal: never a new
+    /// key (D m/30267).
+    Imported,
 }
 
 /// Why no key was adopted. It never names the key's value.
 #[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SignerError {
     /// The keychain can't be read now (locked, or it refused without a dialog). Nothing is made in the
     /// key's place: try again later.
@@ -66,6 +71,9 @@ pub enum SignerError {
     NotAKey(Item),
     /// The keychain failed in its own words.
     Store(String),
+    /// The item holds another key than the one a product held before custody: two keys for one role, refused, never
+    /// "the first one wins" (D m/30267). Neither key is named.
+    Forked(Item),
 }
 
 impl fmt::Display for SignerError {
@@ -84,6 +92,7 @@ impl fmt::Display for SignerError {
             ),
             Self::NotAKey(item) => write!(f, "{item} doesn't hold a 32-byte key"),
             Self::Store(why) => write!(f, "{why}"),
+            Self::Forked(item) => write!(f, "role-key-forked: {item} holds another key than the one this product held"),
         }
     }
 }
@@ -131,6 +140,68 @@ pub fn step(read: Read) -> Step {
 /// build's item fails the keychain's access list on `get`, so deciding from `get` would read it as
 /// Unavailable, "try later", when what it needs is a hand-off. The value is read only to use it.
 pub fn adopt(keychain: &Keychain, item: &Item, made_by: &str) -> Result<(SigningKey, Adopted), SignerError> {
+    adopt_or(keychain, item, made_by, || {
+        write_key(keychain, item, made_by, ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng), Adopted::Made)
+    })
+}
+
+/// The key a product held before custody (`key`: its 32 bytes, or 64 hex digits, a newline allowed), brought into
+/// `item` for this build (D m/30267). It never mints: nothing held, it writes `key`, reads it back and compares;
+/// this build's item held already (a crash after the write, say), it must hold that same key. Two different keys for
+/// one role are [`SignerError::Forked`]. Every other case is [`adopt`]'s, by the same [`step`].
+///
+/// # Errors
+/// [`SignerError::NotAKey`] for bytes that aren't a key, [`SignerError::Forked`], and [`adopt`]'s refusals.
+pub fn adopt_existing(
+    keychain: &Keychain,
+    item: &Item,
+    made_by: &str,
+    key: &[u8],
+) -> Result<(SigningKey, Adopted), SignerError> {
+    let given = seed_of(item, key)?;
+    let public = given.verifying_key();
+    let (kept, how) =
+        adopt_or(keychain, item, made_by, || write_key(keychain, item, made_by, given, Adopted::Imported))?;
+    if kept.verifying_key() != public {
+        return Err(SignerError::Forked(item.clone()));
+    }
+    Ok((kept, how))
+}
+
+/// [`adopt_existing`] from the file a product held its key in, with the hand-off ordered by what its readers trust
+/// (house node `durable.order`; D m/30267): the item is written, read back and compared first, and only then is the file
+/// renamed `<name>.adopted`, never deleted. A crash anywhere leaves the file still authoritative or the item verified
+/// equal to it, and a second run finds the item and renames the file.
+///
+/// # Errors
+/// [`SignerError::Store`] for a file that can't be read or renamed, by its path, and [`adopt_existing`]'s refusals,
+/// which leave the file as it was.
+pub fn adopt_file(
+    keychain: &Keychain,
+    item: &Item,
+    made_by: &str,
+    file: &std::path::Path,
+) -> Result<(SigningKey, Adopted), SignerError> {
+    let bytes = zeroize::Zeroizing::new(
+        std::fs::read(file).map_err(|e| SignerError::Store(format!("{}: {e}", file.display())))?,
+    );
+    let adopted = adopt_existing(keychain, item, made_by, &bytes)?;
+    let mut name = file.file_name().map(std::ffi::OsStr::to_os_string).unwrap_or_default();
+    name.push(".adopted");
+    let retired = file.with_file_name(name);
+    std::fs::rename(file, &retired)
+        .map_err(|e| SignerError::Store(format!("{item} holds the key, but {} wasn't renamed: {e}", file.display())))?;
+    Ok(adopted)
+}
+
+/// [`step`]'s host for [`adopt`] and [`adopt_existing`]: custody read, then what `step` says, with `make` the one
+/// case that writes a key.
+fn adopt_or(
+    keychain: &Keychain,
+    item: &Item,
+    made_by: &str,
+    make: impl FnOnce() -> Result<(SigningKey, Adopted), SignerError>,
+) -> Result<(SigningKey, Adopted), SignerError> {
     let read = match keychain.held(item) {
         Ok(true) => Read::Held { ours: keychain.maker(item).as_deref() == Some(made_by) },
         Ok(false) => Read::NotHeld { next: matches!(keychain.held(&item.next()), Ok(true)) },
@@ -152,7 +223,7 @@ pub fn adopt(keychain: &Keychain, item: &Item, made_by: &str) -> Result<(Signing
             let secret = keychain.get(item).map_err(|e| unavailable(keychain, item, made_by, e))?;
             Ok((held_by(keychain, item, made_by, &secret)?, Adopted::Finished))
         }
-        Step::Make => make(keychain, item, made_by),
+        Step::Make => make(),
         Step::RefuseUnavailable => Err(SignerError::Unavailable {
             item: item.clone(),
             maker: keychain.maker(item),
@@ -161,8 +232,15 @@ pub fn adopt(keychain: &Keychain, item: &Item, made_by: &str) -> Result<(Signing
     }
 }
 
-fn make(keychain: &Keychain, item: &Item, made_by: &str) -> Result<(SigningKey, Adopted), SignerError> {
-    let key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+/// Write `key` into `item` for `made_by`, read it back and compare: how [`adopt`] makes one and [`adopt_existing`]
+/// imports one, said as `how`.
+fn write_key(
+    keychain: &Keychain,
+    item: &Item,
+    made_by: &str,
+    key: ed25519_dalek::SigningKey,
+    how: Adopted,
+) -> Result<(SigningKey, Adopted), SignerError> {
     let made = key.verifying_key();
     let value = zeroize::Zeroizing::new(hex(&key.to_bytes()));
     match keychain.add(item, &Secret::new(value.as_bytes().to_vec()), made_by) {
@@ -181,7 +259,7 @@ fn make(keychain: &Keychain, item: &Item, made_by: &str) -> Result<(SigningKey, 
     if kept.verifying_key() != made {
         return Err(SignerError::Store(format!("{item} was written but reads back another key")));
     }
-    Ok((kept, Adopted::Made))
+    Ok((kept, how))
 }
 
 /// This build's key from a held item: noted as made by this build, and a key.
@@ -217,13 +295,21 @@ fn parse(item: &Item, secret: &Secret) -> Result<SigningKey, SignerError> {
     })
 }
 
+/// A key from what a product held: its 32 bytes, or 64 hex digits (a newline allowed), as an item holds it.
+fn seed_of(item: &Item, key: &[u8]) -> Result<ed25519_dalek::SigningKey, SignerError> {
+    if let Ok(seed) = <[u8; 32]>::try_from(key) {
+        return Ok(ed25519_dalek::SigningKey::from_bytes(&zeroize::Zeroizing::new(seed)));
+    }
+    parse(item, &Secret::new(key.to_vec())).map(|k| k.0)
+}
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Adopted, Read, SignerError, Step, account, adopt, step};
+    use super::{Adopted, Read, SignerError, Step, account, adopt, adopt_existing, adopt_file, step};
     use crate::Secret;
     use crate::custody::{Item, Keychain};
     use ed25519_dalek::Verifier as _;
@@ -374,5 +460,68 @@ mod tests {
         let it = item("node-a");
         k.add(&it, &Secret::new(b"not hex".to_vec()), ME).expect("held");
         assert!(matches!(adopt(&k, &it, ME), Err(SignerError::NotAKey(_))));
+    }
+
+    /// D m/30267: a role held only in a file adopts its own key. The same public key before and after, the item written
+    /// and read back first, and only then the file renamed `.adopted`, never deleted. Afterwards the item alone serves,
+    /// and nothing is minted.
+    #[test]
+    fn a_file_only_role_adopts_its_own_key_and_the_file_is_renamed_after() {
+        let (dir, k, _) = keychain();
+        let it = item("01a09ccd-file");
+        let seed = [7u8; 32];
+        let public = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key();
+        let file = dir.path().join("signer.key");
+        std::fs::write(&file, seed).expect("a role's key file");
+        let (key, how) = adopt_file(&k, &it, ME, &file).expect("adopted");
+        assert_eq!((key.verifying_key(), how), (public, Adopted::Imported));
+        assert!(!file.exists(), "the file is no longer authoritative");
+        assert_eq!(std::fs::read(dir.path().join("signer.key.adopted")).expect("kept"), seed, "renamed, never deleted");
+        let (again, how) = adopt(&k, &it, ME).expect("held");
+        assert_eq!((again.verifying_key(), how), (public, Adopted::Held), "the item serves, and nothing is minted");
+    }
+
+    /// A crash after the item was written and before the rename: the next run finds this build's item holding the same
+    /// key, reads it as held, and renames the file then. A key given as 64 hex digits is the same key as its bytes.
+    #[test]
+    fn a_crash_after_the_write_is_finished_by_the_next_run_with_no_new_key() {
+        let (dir, k, _) = keychain();
+        let it = item("01a09ccd-crash");
+        let seed = [9u8; 32];
+        let hex: String = seed.iter().map(|b| format!("{b:02x}")).collect();
+        let (first, how) = adopt_existing(&k, &it, ME, format!("{hex}\n").as_bytes()).expect("imported");
+        assert_eq!(how, Adopted::Imported);
+        let file = dir.path().join("signer.key");
+        std::fs::write(&file, seed).expect("the file, still there");
+        let (second, how) = adopt_file(&k, &it, ME, &file).expect("finished");
+        assert_eq!((second.verifying_key(), how), (first.verifying_key(), Adopted::Held));
+        assert!(dir.path().join("signer.key.adopted").exists() && !file.exists());
+    }
+
+    /// Two different keys for one role are refused by name, never "the first one wins", and the file is left as it
+    /// was; another build's item is refused as another build's, the file untouched too.
+    #[test]
+    fn a_file_and_an_item_that_differ_are_refused_as_forked_and_the_file_is_kept() {
+        let (dir, k, _) = keychain();
+        let it = item("01a09ccd-forked");
+        adopt_existing(&k, &it, ME, &[1u8; 32]).expect("one key held");
+        let file = dir.path().join("signer.key");
+        std::fs::write(&file, [2u8; 32]).expect("another key in the file");
+        let forked = adopt_file(&k, &it, ME, &file).expect_err("refused");
+        assert_eq!(forked, SignerError::Forked(it.clone()));
+        assert!(forked.to_string().starts_with("role-key-forked: "), "{forked}");
+        assert!(file.exists(), "the file is left as it was");
+        let theirs = item("01a09ccd-theirs");
+        adopt_existing(&k, &theirs, OTHER, &[3u8; 32]).expect("another build's");
+        let refused = adopt_file(&k, &theirs, ME, &file).expect_err("refused");
+        assert!(matches!(refused, SignerError::AnotherBuilds { .. }), "{refused:?}");
+        assert!(file.exists());
+        let garbage = dir.path().join("garbage.key");
+        std::fs::write(&garbage, b"not a key").expect("garbage");
+        assert_eq!(
+            adopt_file(&k, &item("01a09ccd-garbage"), ME, &garbage).err(),
+            Some(SignerError::NotAKey(item("01a09ccd-garbage")))
+        );
+        assert!(garbage.exists());
     }
 }

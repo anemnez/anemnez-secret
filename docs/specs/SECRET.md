@@ -77,6 +77,18 @@ never travels (LADON §3). `signer::adopt(keychain, item, made_by)` answers the 
   only the public half, and nothing exports its bytes.
 - The service, the account and the requirement are the caller's. `<signer>@<node id>` is the default
   account shape, so two hosts hold two keys.
+
+<!-- claim: a-key-held-before-custody-is-adopted-never-reminted -->
+**A key a product held before custody is adopted, never reminted** (D m/30267: on a live host, a role key that
+silently changes breaks everything signed under it). `signer::adopt_existing(keychain, item, made_by, key)` takes
+the key's 32 bytes (or 64 hex digits) through the same decision as `adopt`, and only its Make case differs: nothing
+held, it writes that key, reads it back and compares, and never mints. This build's item already held must hold
+that same key, and two different keys for one role are refused `role-key-forked`, naming neither. `signer::adopt_file`
+orders the hand-off by what its readers trust (house node `durable.order`): the item is written and read back
+first, and only then is the file renamed `<name>.adopted`, never deleted. So a crash leaves the file still
+authoritative or the item verified equal to it, and the next run finishes. Which source a product reads first
+(the item, a legacy item, the file) is its own migration reader's, and it mints with `adopt` only when every one is
+absent, saying so by name.
 - **The requirement has one read:** `identity::own_requirement()`, this build's designated requirement as
   `codesign -d -r-` prints it, read through the Security framework from the running code (strictly valid first),
   so no product runs `codesign` for its `made_by` or keeps its own copy of that read (rule 2; D m/24044).
