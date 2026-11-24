@@ -5,7 +5,7 @@ version = 4
 [[package]]
 name = "anemnez-clock"
 version = "0.1.0"
-source = "git+ssh://git@github.com/anemnez/anemnez-clock.git?rev=e982db15fea0#e982db15fea0bbc30113d693a362bacc99048716"
+source = "git+ssh://git@github.com/anemnez/anemnez-clock.git?rev=01c742d45194#01c742d45194ba9b1b006cee6954d98834eb1710"
 dependencies = [
  "libc",
  "tokio",
