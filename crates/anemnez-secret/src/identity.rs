@@ -423,9 +423,10 @@ pub struct FileIdentity {
 /// requirement. Nothing is read from its signature before that passes. Err when there is no file, when it isn't code,
 /// or when its signature doesn't hold, so a caller that guards with it refuses on Err, the safe direction.
 ///
-/// A path names whatever is there when it's read. A caller that then runs the file reads a copy it alone can write
-/// (a 0700 directory of its own), then runs that same copy and checks the running child with [`code_of_pid`], never
-/// the original path, which may change between the check and its use.
+/// A path names whatever is there when it's read, so a pass here says nothing about what runs later. A caller that
+/// runs the file proves a copy, runs that same copy, and checks the running child with [`code_of_pid`] before its
+/// first write. That last check is the guard. A 0700 store keeps out other users, not other processes of this user,
+/// and agents run as this user, so the copy can still be swapped between this check and the exec (D, m/28608).
 /// BLOCKS, possibly for seconds on a large binary: never on an async worker (see the module docs).
 ///
 /// # Errors
