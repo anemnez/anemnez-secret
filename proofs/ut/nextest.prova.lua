@@ -114,6 +114,9 @@ spoken_for("a-key-held-before-custody-is-adopted-never-reminted", {
 	"signer::tests::a_file_only_role_adopts_its_own_key_and_the_file_is_renamed_after",
 	"signer::tests::a_crash_after_the_write_is_finished_by_the_next_run_with_no_new_key",
 	"signer::tests::a_file_and_an_item_that_differ_are_refused_as_forked_and_the_file_is_kept",
+	"signer::tests::a_key_file_others_can_read_is_refused_by_name_and_left_alone",
+	"signer::tests::the_kept_copy_is_retired_overwritten_and_removed",
+	"signer::tests::a_link_in_a_key_files_place_is_refused_and_never_written_through",
 })
 
 spoken_for("a-signing-key-is-made-on-its-host-and-held-by-its-build", {

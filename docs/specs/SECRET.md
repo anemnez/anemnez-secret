@@ -86,7 +86,15 @@ held, it writes that key, reads it back and compares, and never mints. This buil
 that same key, and two different keys for one role are refused `role-key-forked`, naming neither. `signer::adopt_file`
 orders the hand-off by what its readers trust (house node `durable.order`): the item is written and read back
 first, and only then is the file renamed `<name>.adopted`, never deleted. So a crash leaves the file still
-authoritative or the item verified equal to it, and the next run finishes. Which source a product reads first
+authoritative or the item verified equal to it, and the next run finishes. A file is adopted only when it is this
+user's and owner-only, or it is refused `key-file-not-private` and left alone, so a key another process may have
+read or written never becomes a build's identity. The kept copy has an end (E m/30362): `signer::retire_adopted`
+removes it, called by the product once a later run reads the item as held and its adopting build is last-good. The
+unlink is what ends the copy. It overwrites with zeros first only as best effort, since on APFS (copy-on-write) or an
+SSD the zeros land on new blocks and the old ones stay until reused, so it's never a secure erase. The key's real
+retirement is the custody item that replaced it, and the person's disk encryption (D m/30433). A key file is checked
+and read on one handle opened without following a link, and a kept copy is written only when it's a regular file, so
+a link in either place is refused, never followed (E m/30435). Which source a product reads first
 (the item, a legacy item, the file) is its own migration reader's, and it mints with `adopt` only when every one is
 absent, saying so by name.
 - **The requirement has one read:** `identity::own_requirement()`, this build's designated requirement as

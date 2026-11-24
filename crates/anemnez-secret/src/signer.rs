@@ -74,6 +74,10 @@ pub enum SignerError {
     /// The item holds another key than the one a product held before custody: two keys for one role, refused, never
     /// "the first one wins" (D m/30267). Neither key is named.
     Forked(Item),
+    /// A key file another user could read, or that this user doesn't own: never adopted, so a key another process may
+    /// have read or written never becomes this build's identity (E m/30362). The path and its mode or owner, never
+    /// its bytes.
+    NotPrivate { file: std::path::PathBuf, why: String },
 }
 
 impl fmt::Display for SignerError {
@@ -93,6 +97,9 @@ impl fmt::Display for SignerError {
             Self::NotAKey(item) => write!(f, "{item} doesn't hold a 32-byte key"),
             Self::Store(why) => write!(f, "{why}"),
             Self::Forked(item) => write!(f, "role-key-forked: {item} holds another key than the one this product held"),
+            Self::NotPrivate { file, why } => {
+                write!(f, "key-file-not-private: {} {why}; make it 0600 and this user's, then adopt it", file.display())
+            }
         }
     }
 }
@@ -182,9 +189,7 @@ pub fn adopt_file(
     made_by: &str,
     file: &std::path::Path,
 ) -> Result<(SigningKey, Adopted), SignerError> {
-    let bytes = zeroize::Zeroizing::new(
-        std::fs::read(file).map_err(|e| SignerError::Store(format!("{}: {e}", file.display())))?,
-    );
+    let bytes = read_private(file)?;
     let adopted = adopt_existing(keychain, item, made_by, &bytes)?;
     let mut name = file.file_name().map(std::ffi::OsStr::to_os_string).unwrap_or_default();
     name.push(".adopted");
@@ -192,6 +197,82 @@ pub fn adopt_file(
     std::fs::rename(file, &retired)
         .map_err(|e| SignerError::Store(format!("{item} holds the key, but {} wasn't renamed: {e}", file.display())))?;
     Ok(adopted)
+}
+
+/// Remove the `<name>.adopted` copy [`adopt_file`] kept (E m/30362), so no host keeps a forgotten copy of its signing
+/// key beside the custody item that replaced it. The caller calls it once a later run reads the item as
+/// [`Adopted::Held`] and the build that adopted it is last-good, the end of its rollback window; its own rule says when,
+/// and this says how, once. What ends the copy is the unlink. The file is overwritten with zeros first, but only as
+/// best effort: on a copy-on-write filesystem (APFS) or an SSD the zeros land on new blocks and the old ones stay until
+/// reused, so it is never a secure erase (D m/30433). The key's real retirement is the custody item replacing it, and
+/// the person's disk encryption. Opened once without following a link, and only a regular file is touched, so a copy
+/// swapped for a link never gets its target written (E m/30435). Nothing there is nothing to do.
+///
+/// # Errors
+/// [`SignerError::Store`] naming the path, when it can't be opened, overwritten or removed, or isn't a regular file.
+pub fn retire_adopted(file: &std::path::Path) -> Result<bool, SignerError> {
+    use std::io::Write as _;
+    let mut name = file.file_name().map(std::ffi::OsStr::to_os_string).unwrap_or_default();
+    name.push(".adopted");
+    let kept = file.with_file_name(name);
+    let store = |e: std::io::Error| SignerError::Store(format!("{}: {e}", kept.display()));
+    let mut out = match open_no_follow(&kept, true) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(store(e)),
+    };
+    let meta = out.metadata().map_err(store)?;
+    if !meta.is_file() {
+        return Err(SignerError::Store(format!("{} isn't a regular file, so it's left alone", kept.display())));
+    }
+    out.write_all(&vec![0u8; usize::try_from(meta.len()).unwrap_or(0)]).map_err(store)?;
+    out.sync_all().map_err(store)?;
+    drop(out);
+    std::fs::remove_file(&kept).map_err(store)?;
+    Ok(true)
+}
+
+/// `path` opened once, never through a link (`O_NOFOLLOW`): a link in its place is refused, not followed.
+fn open_no_follow(path: &std::path::Path, write: bool) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new().read(!write).write(write).custom_flags(libc::O_NOFOLLOW).open(path)
+}
+
+/// A key file's bytes, read from the one handle its owner and mode were checked on (E m/30435): opened without
+/// following a link, then that handle's owner and mode read, so nothing can swap the file between the check and the
+/// read. Adopted only when it is a regular file, this user's, and owner-only (0600 or tighter).
+fn read_private(file: &std::path::Path) -> Result<zeroize::Zeroizing<Vec<u8>>, SignerError> {
+    use std::io::Read as _;
+    use std::os::unix::fs::MetadataExt as _;
+    let store = |e: std::io::Error| SignerError::Store(format!("{}: {e}", file.display()));
+    let not = |why: String| SignerError::NotPrivate { file: file.to_path_buf(), why };
+    let mut handle = open_no_follow(file, false).map_err(|e| {
+        if e.raw_os_error() == Some(libc::ELOOP) {
+            not("is a link, which is never followed".to_owned())
+        } else {
+            store(e)
+        }
+    })?;
+    let meta = handle.metadata().map_err(store)?;
+    if !meta.is_file() {
+        return Err(not("isn't a regular file".to_owned()));
+    }
+    let me = nix_uid();
+    if meta.uid() != me {
+        return Err(not(format!("is owned by uid {}, not this user's {me}", meta.uid())));
+    }
+    if meta.mode() & 0o077 != 0 {
+        return Err(not(format!("has mode {:o}, which others can read or write", meta.mode() & 0o777)));
+    }
+    let mut bytes = zeroize::Zeroizing::new(Vec::new());
+    handle.read_to_end(&mut bytes).map_err(store)?;
+    Ok(bytes)
+}
+
+/// This process's effective uid.
+fn nix_uid() -> u32 {
+    // SAFETY: geteuid takes no arguments, has no preconditions and cannot fail.
+    unsafe { libc::geteuid() }
 }
 
 /// [`step`]'s host for [`adopt`] and [`adopt_existing`]: custody read, then what `step` says, with `make` the one
@@ -309,7 +390,7 @@ fn hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Adopted, Read, SignerError, Step, account, adopt, adopt_existing, adopt_file, step};
+    use super::{Adopted, Read, SignerError, Step, account, adopt, adopt_existing, adopt_file, retire_adopted, step};
     use crate::Secret;
     use crate::custody::{Item, Keychain};
     use ed25519_dalek::Verifier as _;
@@ -326,6 +407,13 @@ mod tests {
 
     fn item(node: &str) -> Item {
         Item::new("ai.anemnez.example.signer", account("signer", node))
+    }
+
+    /// A key file as a product keeps one: owner-only.
+    fn key_file(path: &std::path::Path, bytes: &[u8]) {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::write(path, bytes).expect("a key file");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).expect("owner-only");
     }
 
     /// The whole decision, every case: a key is made in exactly one.
@@ -472,7 +560,7 @@ mod tests {
         let seed = [7u8; 32];
         let public = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key();
         let file = dir.path().join("signer.key");
-        std::fs::write(&file, seed).expect("a role's key file");
+        key_file(&file, &seed);
         let (key, how) = adopt_file(&k, &it, ME, &file).expect("adopted");
         assert_eq!((key.verifying_key(), how), (public, Adopted::Imported));
         assert!(!file.exists(), "the file is no longer authoritative");
@@ -492,7 +580,7 @@ mod tests {
         let (first, how) = adopt_existing(&k, &it, ME, format!("{hex}\n").as_bytes()).expect("imported");
         assert_eq!(how, Adopted::Imported);
         let file = dir.path().join("signer.key");
-        std::fs::write(&file, seed).expect("the file, still there");
+        key_file(&file, &seed);
         let (second, how) = adopt_file(&k, &it, ME, &file).expect("finished");
         assert_eq!((second.verifying_key(), how), (first.verifying_key(), Adopted::Held));
         assert!(dir.path().join("signer.key.adopted").exists() && !file.exists());
@@ -506,7 +594,7 @@ mod tests {
         let it = item("01a09ccd-forked");
         adopt_existing(&k, &it, ME, &[1u8; 32]).expect("one key held");
         let file = dir.path().join("signer.key");
-        std::fs::write(&file, [2u8; 32]).expect("another key in the file");
+        key_file(&file, &[2u8; 32]);
         let forked = adopt_file(&k, &it, ME, &file).expect_err("refused");
         assert_eq!(forked, SignerError::Forked(it.clone()));
         assert!(forked.to_string().starts_with("role-key-forked: "), "{forked}");
@@ -517,11 +605,68 @@ mod tests {
         assert!(matches!(refused, SignerError::AnotherBuilds { .. }), "{refused:?}");
         assert!(file.exists());
         let garbage = dir.path().join("garbage.key");
-        std::fs::write(&garbage, b"not a key").expect("garbage");
+        key_file(&garbage, b"not a key");
         assert_eq!(
             adopt_file(&k, &item("01a09ccd-garbage"), ME, &garbage).err(),
             Some(SignerError::NotAKey(item("01a09ccd-garbage")))
         );
         assert!(garbage.exists());
+    }
+
+    /// E m/30362: a key file another user could read, or this user doesn't own, is never adopted, and it's left as it
+    /// was. Said by name with its mode, never its bytes.
+    #[test]
+    fn a_key_file_others_can_read_is_refused_by_name_and_left_alone() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (dir, k, _) = keychain();
+        let file = dir.path().join("signer.key");
+        key_file(&file, &[5u8; 32]);
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).expect("readable by others");
+        let refused = adopt_file(&k, &item("01a09ccd-open"), ME, &file).expect_err("refused");
+        assert!(matches!(&refused, SignerError::NotPrivate { .. }), "{refused:?}");
+        assert!(
+            refused.to_string().starts_with("key-file-not-private: ") && refused.to_string().contains("644"),
+            "{refused}"
+        );
+        assert!(file.exists() && !dir.path().join("signer.key.adopted").exists(), "left as it was");
+        assert!(
+            adopt(&k, &item("01a09ccd-open"), ME).is_ok_and(|(_, how)| how == Adopted::Made),
+            "nothing was written"
+        );
+    }
+
+    /// E m/30362: the kept `.adopted` copy has an end. Retiring it overwrites and removes it; with nothing kept there's
+    /// nothing to do. The item still serves.
+    #[test]
+    fn the_kept_copy_is_retired_overwritten_and_removed() {
+        let (dir, k, _) = keychain();
+        let it = item("01a09ccd-retire");
+        let file = dir.path().join("signer.key");
+        key_file(&file, &[6u8; 32]);
+        let (adopted, _) = adopt_file(&k, &it, ME, &file).expect("adopted");
+        assert_eq!(retire_adopted(&file), Ok(true), "removed");
+        assert!(!dir.path().join("signer.key.adopted").exists() && !file.exists());
+        assert_eq!(retire_adopted(&file), Ok(false), "nothing kept: nothing to do");
+        let (held, how) = adopt(&k, &it, ME).expect("held");
+        assert_eq!((held.verifying_key(), how), (adopted.verifying_key(), Adopted::Held));
+    }
+
+    /// E m/30435: a key file is checked and read on one handle opened without following a link, so a link in its place
+    /// is refused by name, never followed to whatever it points at; and a kept copy swapped for a link is never written
+    /// through, its target untouched.
+    #[test]
+    fn a_link_in_a_key_files_place_is_refused_and_never_written_through() {
+        let (dir, k, _) = keychain();
+        let target = dir.path().join("elsewhere.key");
+        key_file(&target, &[8u8; 32]);
+        let file = dir.path().join("signer.key");
+        std::os::unix::fs::symlink(&target, &file).expect("a link");
+        let refused = adopt_file(&k, &item("01a09ccd-link"), ME, &file).expect_err("refused");
+        assert!(matches!(&refused, SignerError::NotPrivate { why, .. } if why.contains("link")), "{refused:?}");
+        let other = dir.path().join("other.key");
+        std::os::unix::fs::symlink(&target, dir.path().join("other.key.adopted"))
+            .expect("a kept copy swapped for a link");
+        assert!(retire_adopted(&other).is_err(), "a link is never written through");
+        assert_eq!(std::fs::read(&target).expect("the target"), [8u8; 32], "its target is untouched");
     }
 }
