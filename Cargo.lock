@@ -16,6 +16,7 @@ name = "anemnez-secret"
 version = "0.1.0"
 dependencies = [
  "anemnez-clock",
+ "anemnez-trust",
  "block2",
  "core-foundation",
  "ed25519-dalek",
@@ -31,6 +32,11 @@ dependencies = [
  "tokio",
  "zeroize",
 ]
+
+[[package]]
+name = "anemnez-trust"
+version = "0.10.1"
+source = "git+ssh://git@github.com/anemnez/anemnez-extension.git?rev=8ab122e7a1a5#8ab122e7a1a5ede3e3b0556b1138a234de43f9b9"
 
 [[package]]
 name = "base64ct"

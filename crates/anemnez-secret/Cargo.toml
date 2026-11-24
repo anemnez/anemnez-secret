@@ -13,6 +13,9 @@ publish.workspace = true
 # down, and a publish names the registry. At the family's settled clock, 66a972f441f2 (M m/25606, m/26302), which the
 # SDK takes and fabric, artichoke and herald each take at their own family move.
 anemnez-clock = { git = "ssh://git@github.com/anemnez/anemnez-clock.git", rev = "01c742d45194", version = "0.1", registry-index = "sparse+http://127.0.0.1:7787/crates/index/" }
+# The house's team id, its one home (rule 2; D m/32487): a crate with no dependencies, MIT OR Apache-2.0, re-exported as
+# identity::ANEMNEZ_TEAM so callers' path stays. Dual form, as anemnez-clock.
+anemnez-trust = { git = "ssh://git@github.com/anemnez/anemnez-extension.git", rev = "8ab122e7a1a5", version = "0.10", registry-index = "sparse+http://127.0.0.1:7787/crates/index/" }
 # retrust: a private directory for the socket a successor connects to.
 tempfile = "3"
 sha2 = "0.10"
