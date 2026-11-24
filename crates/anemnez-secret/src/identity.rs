@@ -95,10 +95,10 @@ pub fn own() -> Result<Identity, String> {
     Err("this OS has no code signatures to read".to_owned())
 }
 
-/// The house's team: the one Apple team every Anemnez build is signed by, as its runtime home (rule 2; D m/24146).
-/// A build judging itself can't read "my team" from its own signature and call that trust (circular), so a check
-/// that means "our team" compares against this. Each repo's signing `TEAM_ID` and its default trust read it.
-pub const ANEMNEZ_TEAM: &str = "P9DJA3JCKP";
+/// The house's team: the one Apple team every Anemnez build is signed by (D m/24146), from its one home, anemnez-trust
+/// (rule 2; D m/32487). A build judging itself can't read "my team" from its own signature and call that trust
+/// (circular), so a check that means "our team" compares against this.
+pub use anemnez_trust::ANEMNEZ_TEAM;
 
 /// This process's own designated requirement, as text (`codesign -d -r-`'s `designated =>` line): what a key this
 /// build makes in custody admits (`signer::adopt`'s `made_by`). Read through the Security framework from the running
@@ -812,8 +812,8 @@ mod tests {
         use super::{Signer, signer};
         assert_eq!(signer(true, true, None), Signer::Apple, "anchor apple: a platform binary");
         assert_eq!(signer(true, true, Some("X".into())), Signer::Apple, "anchor apple wins over a team field");
-        assert_eq!(signer(false, true, Some("P9DJA3JCKP".into())), Signer::Team("P9DJA3JCKP".into()));
-        assert_eq!(signer(false, false, Some("P9DJA3JCKP".into())), Signer::AdHoc, "a team field under no anchor");
+        assert_eq!(signer(false, true, Some("ABCDE12345".into())), Signer::Team("ABCDE12345".into()));
+        assert_eq!(signer(false, false, Some("ABCDE12345".into())), Signer::AdHoc, "a team field under no anchor");
         assert_eq!(signer(false, true, None), Signer::AdHoc, "the generic anchor naming no team");
         assert_eq!(signer(false, true, Some(String::new())), Signer::AdHoc, "an empty team");
         assert_eq!(signer(false, false, None), Signer::AdHoc);
@@ -989,7 +989,8 @@ mod tests {
 
     use super::*;
 
-    const TEAM: &str = "P9DJA3JCKP";
+    // A team-shaped stand-in for the house, apart from the "ABCDE12345" the rows pose as another team (E m/33193).
+    const TEAM: &str = "QRSTU67890";
 
     fn signature(identifier: &str, flags: u32, entitlements: &[&str]) -> Signature {
         Signature {
