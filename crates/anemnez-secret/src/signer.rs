@@ -371,7 +371,10 @@ fn ours(keychain: &Keychain, item: &Item, made_by: &str) -> bool {
     let noted = keychain.maker(item).as_deref() == Some(made_by);
     let trusted = match keychain.trusts(item) {
         Ok(trusted) => trusted,
-        Err(crate::custody::Trusting::Unsupported { .. }) => return noted,
+        Err(crate::custody::Trusting::Unsupported { why, .. }) => {
+            note_alone(&why);
+            return noted;
+        }
         Err(_) => return false,
     };
     let me = crate::access::requirement(made_by).ok();
@@ -381,6 +384,15 @@ fn ours(keychain: &Keychain, item: &Item, made_by: &str) -> bool {
         Some(r) == me.as_deref() || Some(r) == running.as_deref() || crate::access::team_pinned(r, &table).is_ok()
     };
     ours_by_access(noted, &trusted, me.as_deref(), house)
+}
+
+/// Said once per process at WARN, the first time [`ours`] reads by the note alone, so a host on that fallback is seen
+/// (D m/37770): the rule before carry-across, losing nothing it had, but no longer refusing a planted list.
+fn note_alone(why: &str) {
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| {
+        tracing::warn!(why, "signer reads a held key's owner by its note alone: access lists can't be read")
+    });
 }
 
 /// The access list's half of [`ours`], pure: every entry `house`, and the note naming this build (`noted`) or the list
@@ -452,7 +464,7 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Adopted, Read, SignerError, Step, account, adopt, adopt_existing, adopt_file, held, not_held, ours,
+        Adopted, Read, SignerError, Step, account, adopt, adopt_existing, adopt_file, held, not_held, note_alone, ours,
         ours_by_access, retire_adopted, step,
     };
     use crate::Secret;
@@ -681,6 +693,37 @@ mod tests {
         let plain = item("node-d");
         k.add(&plain, &key, ME).expect("a plain add");
         assert!(ours(&k, &plain, ME), "by its note, its creator entry the running binary's own");
+    }
+
+    /// The note-alone fallback is said at WARN once per process, never again however often it is taken (D m/37770).
+    #[test]
+    fn the_note_alone_fallback_is_said_once_at_warn() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Count(Arc<AtomicUsize>);
+        impl tracing::Subscriber for Count {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                if *event.metadata().level() == tracing::Level::WARN {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+        let warned = Arc::new(AtomicUsize::new(0));
+        tracing::subscriber::with_default(Count(warned.clone()), || {
+            note_alone("this macOS doesn't export SecTrustedApplicationCopyRequirement");
+            note_alone("this macOS doesn't export SecTrustedApplicationCopyRequirement");
+        });
+        assert_eq!(warned.load(Ordering::SeqCst), 1, "said once");
     }
 
     #[test]

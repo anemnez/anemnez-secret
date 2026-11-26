@@ -101,6 +101,7 @@ spoken_for("a-held-key-is-read-only-by-its-owning-build", {
 	"custody::tests::an_item_carried_across_trusts_its_teams_requirements_alone",
 	"custody::tests::a_rename_keeps_every_requirement_the_item_trusted",
 	"access::tests::a_call_this_macos_doesnt_export_is_a_named_refusal",
+	"signer::tests::the_note_alone_fallback_is_said_once_at_warn",
 })
 spoken_for("a-hand-off-never-leaves-a-key-unheld", {
 	"handoff::tests::a_hand_off_moves_the_value_and_finishes_after_a_cut",

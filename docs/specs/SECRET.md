@@ -52,7 +52,9 @@ is named by a service and an account the product chooses (a per-instance account
   `SecTrustedApplicationCopyRequirement`, are exported by Security.framework but declared only in its private
   header. They are never linked: they are resolved at first use by `dlsym`, and a macOS that stops exporting
   either answers `Trusting::Unsupported`, named, from `add_trusting` and `trusts` alone. No product fails to
-  load, and an ordinary adopt goes on by its note (E m/37742, D m/37740).
+  load, and an ordinary adopt goes on by its note alone, today's rule (E m/37742, D m/37740). That is the
+  weaker check: on such a macOS the planted-entry check below is off (E m/37772, F m/37773). It is said once
+  at WARN when taken, so a host on that fallback is seen (D m/37770).
 
 <!-- claim: a-hand-off-never-leaves-a-key-unheld -->
 **A key carried across a signing change is held at every step** (from Artichoke's keyring, F). A
