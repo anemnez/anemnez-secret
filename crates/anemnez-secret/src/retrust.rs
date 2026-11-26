@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use crate::Secret;
 use crate::custody::{Item, Keychain};
-use crate::handoff::{self, Successor};
+use crate::handoff::{self, HandOffError, Successor};
 use crate::identity::Identity;
 use crate::owner::OwnerCheck;
 
@@ -72,7 +72,13 @@ fn read_frame(stream: &mut UnixStream) -> Result<Vec<u8>, String> {
 /// The holder's view of the child over its connection.
 struct Remote {
     stream: UnixStream,
+    item: Item,
 }
+
+/// The successor's answer to `finish`: `ok`, or `kept` and why in the frame after it (a kept hand-off, by value: F
+/// m/38787), or anything else, a failure in its own words.
+const FINISHED: &[u8] = b"ok";
+const KEPT: &[u8] = b"kept";
 
 impl Successor for Remote {
     fn receive(&mut self, value: &Secret, nonce: &[u8; 32]) -> Result<Vec<u8>, String> {
@@ -82,10 +88,17 @@ impl Successor for Remote {
         read_frame(&mut self.stream)
     }
 
-    fn finish(&mut self) -> Result<(), String> {
+    fn finish(&mut self) -> Result<(), HandOffError> {
         write_frame(&mut self.stream, b"finish")?;
         let answer = read_frame(&mut self.stream)?;
-        if answer == b"ok" { Ok(()) } else { Err(String::from_utf8_lossy(&answer).into_owned()) }
+        if answer == FINISHED {
+            return Ok(());
+        }
+        if answer == KEPT {
+            let why = String::from_utf8_lossy(&read_frame(&mut self.stream)?).into_owned();
+            return Err(HandOffError::Kept { item: self.item.clone(), why });
+        }
+        Err(HandOffError::Failed(String::from_utf8_lossy(&answer).into_owned()))
     }
 }
 
@@ -124,6 +137,11 @@ pub type Identify<'a> = &'a dyn Fn(&UnixStream) -> Result<Identity, String>;
 /// [`SOCKET_ENV`] naming the socket, which must answer as `expected`. `own` is this build's identity
 /// ([`crate::identity::own`]).
 /// On `clock`, the host's one clock (house rule 3): the successor's connect and each step are bounded on it.
+///
+/// # Errors
+/// [`HandOffError::Kept`] when the successor wrote the item and kept its `.next` (the outcome a hand-off ends in until
+/// the placed build's `signer::held_confirmed` finishes it), read by value off the wire; [`HandOffError::Failed`] in
+/// words for anything else, the original left held.
 #[allow(clippy::too_many_arguments)]
 pub fn to_on(
     clock: &anemnez_clock::Clock,
@@ -135,7 +153,7 @@ pub fn to_on(
     own: &Identity,
     owner: &dyn OwnerCheck,
     identify: Identify<'_>,
-) -> Result<(), String> {
+) -> Result<(), HandOffError> {
     let dir = tempfile::Builder::new().prefix("retrust").tempdir().map_err(|e| e.to_string())?;
     // 0700 keeps other users out; any process of THIS user could still enter, so what limits the
     // hand-off to one process is accept_from's pid check, not the directory (F, 2026-11-06).
@@ -160,7 +178,7 @@ pub fn to_on(
         stream.set_read_timeout(Some(STEP)).map_err(|e| e.to_string())?;
         let who = identify(&stream)?;
         allowed(&who, own, expected, owner)?;
-        handoff::hand_off(keychain, item, &mut Remote { stream })
+        handoff::hand_off(keychain, item, &mut Remote { stream, item: item.clone() })
     })();
     let _ = child.wait();
     result
@@ -188,9 +206,19 @@ pub fn serve(socket: &Path, keychain: &Keychain, item: &Item, made_by: &str) -> 
                 write_frame(&mut stream, &proof)?;
             }
             b"finish" => {
-                let answer = handoff::finish(keychain, item, made_by);
-                write_frame(&mut stream, answer.as_ref().map_or_else(|e| e.as_bytes(), |()| b"ok"))?;
-                return answer;
+                return match handoff::finish(keychain, item, made_by) {
+                    Ok(()) => write_frame(&mut stream, FINISHED),
+                    // Written, `.next` kept by design: this child's work is done, and the holder learns it by value.
+                    Err(HandOffError::Kept { why, .. }) => {
+                        write_frame(&mut stream, KEPT)?;
+                        write_frame(&mut stream, why.as_bytes())
+                    }
+                    Err(failed) => {
+                        let why = failed.to_string();
+                        write_frame(&mut stream, why.as_bytes())?;
+                        Err(why)
+                    }
+                };
             }
             other => {
                 return Err(format!("an unknown step {:?}", String::from_utf8_lossy(other)));
@@ -314,7 +342,8 @@ mod tests {
             &owner,
             &impostor,
         )
-        .unwrap_err();
+        .unwrap_err()
+        .to_string();
         assert!(refused.contains("not the expected"), "{refused}");
         assert!(k.held(&item).unwrap() && !k.held(&item.next()).unwrap(), "nothing moved");
 
@@ -322,7 +351,8 @@ mod tests {
         let real = |s: &std::os::unix::net::UnixStream| crate::identity::of_peer(std::os::fd::AsFd::as_fd(s));
         let unsigned =
             to_on(&anemnez_clock::Clock::system(), &k, &item, &me, &args, "ai.anemnez.exampled", &own, &owner, &real)
-                .unwrap_err();
+                .unwrap_err()
+                .to_string();
         assert!(!unsigned.contains("ZZZtop"), "{unsigned}");
         assert!(k.held(&item).unwrap() && !k.held(&item.next()).unwrap(), "an unsigned child gets nothing");
 
@@ -342,7 +372,10 @@ mod tests {
             &successor,
         )
         .unwrap_err();
-        assert!(kept.contains("hand-off-kept"), "{kept}");
+        assert!(
+            matches!(&kept, crate::handoff::HandOffError::Kept { item: i, why } if *i == item && why.starts_with("hand-off-kept")),
+            "a kept hand-off is answered by value over the wire (F m/38787): {kept:?}"
+        );
         assert_eq!(k.get(&item).unwrap().expose(|v| v.to_vec()), VALUE.as_bytes());
         assert!(k.held(&item.next()).unwrap(), ".next kept beside it");
         assert_eq!(k.maker(&item).as_deref(), Some("the child"), "the child's item now");

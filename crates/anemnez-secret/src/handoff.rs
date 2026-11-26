@@ -56,6 +56,40 @@ fn nonce() -> Result<[u8; 32], String> {
     Ok(n)
 }
 
+/// Why a hand-off didn't end with `.next` gone: kept by design, or failed. A caller matches the value, never a phrase
+/// (F m/38787, rule 15).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum HandOffError {
+    /// `hand-off-kept`: the item is written and `.next` kept beside it, since no reader other than the writer read
+    /// it (D m/38588). Nothing is lost: the placed build's `signer::held_confirmed` finishes it. `why` says so whole.
+    Kept { item: Item, why: String },
+    /// It failed, in words: nothing that was held is lost.
+    Failed(String),
+}
+
+impl std::fmt::Display for HandOffError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Kept { why, .. } | Self::Failed(why) => f.write_str(why),
+        }
+    }
+}
+
+impl std::error::Error for HandOffError {}
+
+impl From<String> for HandOffError {
+    fn from(why: String) -> Self {
+        Self::Failed(why)
+    }
+}
+
+impl From<HandOffError> for String {
+    fn from(e: HandOffError) -> Self {
+        e.to_string()
+    }
+}
+
 /// The build a value is handed to: in use, the new binary as a checked child process (its identity
 /// judged by its connection's audit token, `identity`), and a stand-in in tests.
 pub trait Successor {
@@ -63,27 +97,33 @@ pub trait Successor {
     /// the successor's connection, in use), checked by [`verify`].
     fn receive(&mut self, value: &Secret, nonce: &[u8; 32]) -> Result<Vec<u8>, String>;
     /// Move `.next` to the item, once the original is gone.
-    fn finish(&mut self) -> Result<(), String>;
+    ///
+    /// # Errors
+    /// [`HandOffError::Kept`] when it is written and `.next` kept; [`HandOffError::Failed`] otherwise.
+    fn finish(&mut self) -> Result<(), HandOffError>;
 }
 
 /// The old build's side: hand `item`'s value to `successor`, removing the original only after the
 /// successor has proved it holds the same value. Run again after a cut, it finishes.
-pub fn hand_off(keychain: &Keychain, item: &Item, successor: &mut dyn Successor) -> Result<(), String> {
+///
+/// # Errors
+/// [`HandOffError::Kept`] when the successor wrote the item and kept `.next`; [`HandOffError::Failed`] otherwise.
+pub fn hand_off(keychain: &Keychain, item: &Item, successor: &mut dyn Successor) -> Result<(), HandOffError> {
     match keychain.get(item) {
         Ok(value) => {
             let nonce = nonce()?;
             let theirs = successor.receive(&value, &nonce)?;
             if !verify(&witness(&value, &nonce), &theirs) {
-                return Err(format!(
+                return Err(HandOffError::Failed(format!(
                     "the successor kept another value under {}; the original is left as it is",
                     item.next()
-                ));
+                )));
             }
             keychain.remove(item).map_err(|e| e.to_string())?;
         }
         // Removed on an earlier run that was cut short: the successor's .next holds it.
         Err(CustodyError::NotHeld(_)) => {}
-        Err(e) => return Err(e.to_string()),
+        Err(e) => return Err(HandOffError::Failed(e.to_string())),
     }
     successor.finish()
 }
@@ -112,11 +152,12 @@ pub fn receive(
 /// reader's word, removes `.next`. `retrust::serve` finishes so: the item it read from is never removed.
 ///
 /// # Errors
-/// As [`finish_confirmed`], and a move kept beside its `.next` as `hand-off-kept`.
-pub fn finish(keychain: &Keychain, item: &Item, made_by: &str) -> Result<(), String> {
+/// [`HandOffError::Kept`] for a move kept beside its `.next`; [`finish_confirmed`]'s failures as
+/// [`HandOffError::Failed`].
+pub fn finish(keychain: &Keychain, item: &Item, made_by: &str) -> Result<(), HandOffError> {
     match finish_confirmed(keychain, item, made_by, &NoOtherReader)? {
         Finished::Done => Ok(()),
-        Finished::Kept(why) => Err(why),
+        Finished::Kept(why) => Err(HandOffError::Kept { item: item.clone(), why }),
     }
 }
 
@@ -210,14 +251,14 @@ mod tests {
             }
             Ok(if self.lie { witness(&Secret::new(b"another".to_vec()), nonce) } else { w }.to_vec())
         }
-        fn finish(&mut self) -> Result<(), String> {
+        fn finish(&mut self) -> Result<(), super::HandOffError> {
             if self.cut {
-                return Err("cut short".into());
+                return Err(super::HandOffError::Failed("cut short".into()));
             }
             // The placed build, run fresh, read it: the carry's finish.
             match super::finish_confirmed(self.keychain, &self.item, NEW, &Says(crate::custody::Confirmed::Reads))? {
                 super::Finished::Done => Ok(()),
-                super::Finished::Kept(why) => Err(why),
+                super::Finished::Kept(why) => Err(super::HandOffError::Kept { item: self.item.clone(), why }),
             }
         }
     }
@@ -259,7 +300,7 @@ mod tests {
         let item = Item::new("ai.anemnez.example.role", "short@node");
         k.add(&item, &Secret::new(VALUE.into()), "old").unwrap();
         let mut short = Local { keychain: &k, item: item.clone(), cut: false, lie: false, short: true };
-        assert!(hand_off(&k, &item, &mut short).unwrap_err().contains("left as it is"));
+        assert!(hand_off(&k, &item, &mut short).unwrap_err().to_string().contains("left as it is"));
         assert_eq!(held(&k, &item).as_deref(), Some(VALUE.as_bytes()), "the original stays");
         let w = witness(&Secret::new(VALUE.into()), &[7u8; 32]);
         assert!(super::verify(&w, &w) && !super::verify(&w, &w[..31]) && !super::verify(&w, &[0u8; 33]));
@@ -272,7 +313,7 @@ mod tests {
         let item = Item::new("ai.anemnez.example.role", "feed@node");
         k.add(&item, &Secret::new(VALUE.into()), "old").unwrap();
         let mut liar = Local { keychain: &k, item: item.clone(), cut: false, lie: true, short: false };
-        let refused = hand_off(&k, &item, &mut liar).unwrap_err();
+        let refused = hand_off(&k, &item, &mut liar).unwrap_err().to_string();
         assert!(refused.contains("left as it is"), "{refused}");
         assert!(!refused.contains("ZZZtop"), "{refused}");
         assert_eq!(held(&k, &item).as_deref(), Some(VALUE.as_bytes()), "the original stays");
@@ -286,20 +327,23 @@ mod tests {
         let item = Item::new("ai.anemnez.example.role", "x");
         k.add(&item, &Secret::new(VALUE.into()), "old").unwrap();
         k.add(&item.next(), &Secret::new(VALUE.into()), NEW).unwrap();
-        assert!(finish(&k, &item, NEW).unwrap_err().starts_with("hand-off-kept"), "no other reader: .next is kept");
+        let kept = finish(&k, &item, NEW).unwrap_err();
+        assert!(matches!(&kept, super::HandOffError::Kept { item: i, .. } if *i == item), "kept, by value: {kept:?}");
+        assert!(kept.to_string().starts_with("hand-off-kept"), "and said by name");
         assert!(held(&k, &item.next()).is_some());
         let read = Says(crate::custody::Confirmed::Reads);
         assert_eq!(super::finish_confirmed(&k, &item, NEW, &read), Ok(super::Finished::Done), "read fresh: .next goes");
         assert!(held(&k, &item.next()).is_none());
         k.add(&item.next(), &Secret::new(b"different".to_vec()), NEW).unwrap();
-        assert!(finish(&k, &item, NEW).unwrap_err().contains("different values"));
+        let differ = finish(&k, &item, NEW).unwrap_err();
+        assert!(matches!(&differ, super::HandOffError::Failed(why) if why.contains("different values")), "{differ:?}");
         assert_eq!(held(&k, &item).as_deref(), Some(VALUE.as_bytes()), "nothing changed");
         assert!(matches!(
             k.add(&item, &Secret::new(b"over".to_vec()), NEW),
             Err(crate::custody::CustodyError::Exists(_))
         ));
         let none = Item::new("ai.anemnez.example.role", "absent");
-        assert!(finish(&k, &none, NEW).unwrap_err().contains("neither"));
+        assert!(finish(&k, &none, NEW).unwrap_err().to_string().contains("neither"));
     }
 
     /// A stand-in for the placed build run fresh: it answers what it's told.

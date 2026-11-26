@@ -85,7 +85,8 @@ short of a match it is `hand-off-kept`, both held, and runs again. Nothing else 
 `held` and `adopt`, meeting a pending `.next` (alone or beside the item), read the key from whichever
 item this build reads, leave the pair as it is and say `hand-off-pending`; `handoff::finish` and
 retrust's `serve` write the item and keep `.next`, `hand-off-kept`, so the item they read from is never
-removed. Plain `rename` keeps the writer's own read-back, named `WritersOwnRead`, for a move whose next
+removed. A kept hand-off is a value, `HandOffError::Kept`, from `hand_off`, `finish` and `retrust::to_on`
+alike, carried over retrust's wire as its own `kept` frame: a caller matches it, never a phrase (F m/38787). Plain `rename` keeps the writer's own read-back, named `WritersOwnRead`, for a move whose next
 reader is the same build (fabricd's seal).
 
 <!-- claim: a-key-goes-only-to-a-checked-successor -->
