@@ -565,6 +565,15 @@ impl Keychain {
         crate::access::listing(&access).map_err(|refused| Trusting::of(item, refused))
     }
 
+    /// For rows only: the descriptions of `item`'s access entries, its partitions aside.
+    #[cfg(test)]
+    pub(crate) fn descriptions(&self, item: &Item) -> Vec<String> {
+        let Ok(found) = self.reference(item) else { return Vec::new() };
+        crate::access::of(core_foundation::base::TCFType::as_concrete_TypeRef(&found))
+            .map(|access| crate::access::descriptions(&access))
+            .unwrap_or_default()
+    }
+
     /// `item`'s keychain reference, found by its attributes: the value is never read.
     fn reference(
         &self,
@@ -636,9 +645,11 @@ impl Keychain {
         confirm: &dyn Confirm,
     ) -> Result<Moved, CustodyError> {
         let value = self.get(from)?;
-        let access =
-            crate::access::of_for_writing(core_foundation::base::TCFType::as_concrete_TypeRef(&self.reference(from)?))
-                .map_err(|status| CustodyError::Store { item: from.clone(), status })?;
+        let access = crate::access::of_for_writing(
+            core_foundation::base::TCFType::as_concrete_TypeRef(&self.reference(from)?),
+            &format!("{} / {}", to.service, to.account),
+        )
+        .map_err(|status| CustodyError::Store { item: from.clone(), status })?;
         self.add_with(to, &value, made_by, Some(&access))?;
         let back = self.get(to)?;
         if back.expose(|b| value.expose(|v| b != v)) {
@@ -922,6 +933,23 @@ mod tests {
         assert!(before.contains(&crate::access::requirement(&now).expect("parses")));
         assert!(!k.held(&item.next()).expect("reads"), ".next is gone");
         assert_eq!(k.get(&item).expect("reads").expose(|v| v.to_vec()), VALUE.as_bytes());
+    }
+
+    /// A moved item's entries are named for it, never for the `.next` it was moved from (E m/38947): an audit reading
+    /// the descriptions sees the item's own name.
+    #[test]
+    fn a_moved_items_entries_are_named_for_it() {
+        let (_dir, k) = keychain();
+        let item = Item::new("ai.anemnez.example.role", "promoter@node");
+        let now = team("ai.anemnez.exampled");
+        k.add_trusting_unpinned(&item.next(), &Secret::new(VALUE.as_bytes().to_vec()), MAKER, &[&now], true)
+            .expect("made");
+        let before = k.descriptions(&item.next());
+        assert!(before.iter().any(|d| d.ends_with(".next")), "posed: {before:?}");
+        k.rename(&item.next(), &item, MAKER).expect("moved into place");
+        let after = k.descriptions(&item);
+        assert!(!after.is_empty(), "it has entries");
+        assert!(after.iter().all(|d| d == "ai.anemnez.example.role / promoter@node"), "named for the item: {after:?}");
     }
 
     /// A stand-in for the fresh process a carry spawns: it answers what it's told.

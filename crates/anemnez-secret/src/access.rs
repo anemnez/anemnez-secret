@@ -42,6 +42,7 @@ unsafe extern "C" {
     ) -> OSStatus;
     fn SecACLCopyAuthorizations(acl: SecAclRef) -> CFArrayRef;
     fn SecACLRemove(acl: SecAclRef) -> OSStatus;
+    fn SecACLSetContents(acl: SecAclRef, apps: CFArrayRef, description: CFStringRef, prompt: u16) -> OSStatus;
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -246,10 +247,12 @@ pub(crate) fn of(item: SecKeychainItemRef) -> Result<CFType, OSStatus> {
     owned(access.cast()).filter(|_| status == 0).ok_or(status)
 }
 
-/// `item`'s access list for writing another item: its entries without the `partition_id` ones (F m/38557). securityd
-/// stamps the new item's creator itself, and an add that sets a partition entry asks for the keychain's password
-/// wherever securityd stamps (under ~/Library/Keychains), so a copied stamp is refused there with dialogs off.
-pub(crate) fn of_for_writing(item: SecKeychainItemRef) -> Result<CFType, OSStatus> {
+/// `item`'s access list for writing another item, `label`: its entries without the `partition_id` ones (F m/38557),
+/// each other entry named `label` (E m/38947). securityd stamps the new item's creator itself, and an add that sets a
+/// partition entry asks for the keychain's password wherever securityd stamps (under ~/Library/Keychains), so a copied
+/// stamp is refused there with dialogs off. The entries keep who they trust and their prompt, never the old item's
+/// name, so an audit reading them sees the item they're on.
+pub(crate) fn of_for_writing(item: SecKeychainItemRef, label: &str) -> Result<CFType, OSStatus> {
     let access = of(item)?;
     let mut acls: CFArrayRef = std::ptr::null();
     // SAFETY: `access` is alive for the call; the list is returned owned.
@@ -261,21 +264,39 @@ pub(crate) fn of_for_writing(item: SecKeychainItemRef) -> Result<CFType, OSStatu
     let acls: CFArray<CFType> = unsafe { CFArray::wrap_under_create_rule(acls) };
     // SAFETY: an immutable CFString constant the framework exports.
     let partition = unsafe { CFString::wrap_under_get_rule(kSecACLAuthorizationPartitionID) };
+    let label = CFString::new(label);
     for acl in acls.iter() {
         let acl = acl.as_CFTypeRef().cast_mut();
         // SAFETY: `acl` is alive while `acls` is; the list is returned owned (a Copy call).
         let auths = unsafe { SecACLCopyAuthorizations(acl) };
-        if auths.is_null() {
-            continue;
-        }
-        // SAFETY: as above.
-        let auths: CFArray<CFString> = unsafe { CFArray::wrap_under_create_rule(auths) };
-        if auths.iter().any(|a| *a == partition) {
+        let stamps = !auths.is_null() && {
+            // SAFETY: as above.
+            let auths: CFArray<CFString> = unsafe { CFArray::wrap_under_create_rule(auths) };
+            auths.iter().any(|a| *a == partition)
+        };
+        if stamps {
             // SAFETY: `acl` belongs to `access`, a copy this call owns; removing it edits that copy alone.
             let status = unsafe { SecACLRemove(acl) };
             if status != 0 {
                 return Err(status);
             }
+            continue;
+        }
+        let (mut apps, mut description, mut prompt): (CFArrayRef, CFStringRef, u16) =
+            (std::ptr::null(), std::ptr::null(), 0);
+        // SAFETY: out-parameters only; each result is owned here.
+        let status = unsafe { SecACLCopyContents(acl, &mut apps, &mut description, &mut prompt) };
+        let _description = owned(description.cast());
+        let apps = owned(apps.cast());
+        if status != 0 {
+            return Err(status);
+        }
+        let apps = apps.as_ref().map_or(std::ptr::null(), |a| a.as_CFTypeRef().cast());
+        // SAFETY: `acl` belongs to `access`, a copy this call owns; the apps (null: any application, kept as such) and
+        // the label live for the call.
+        let status = unsafe { SecACLSetContents(acl, apps, label.as_concrete_TypeRef(), prompt) };
+        if status != 0 {
+            return Err(status);
         }
     }
     Ok(access)
@@ -405,6 +426,44 @@ pub(crate) fn partitions_of(description: &str) -> Option<Vec<String>> {
     // SAFETY: as above.
     let partitions: CFArray<CFType> = unsafe { CFArray::wrap_under_get_rule(partitions.as_concrete_TypeRef()) };
     partitions.iter().map(|p| p.downcast::<CFString>().map(|p| p.to_string())).collect()
+}
+
+/// For rows only: the descriptions of `access`'s entries other than its `partition_id` ones (each the name a prompt
+/// would show).
+#[cfg(test)]
+pub(crate) fn descriptions(access: &CFType) -> Vec<String> {
+    let mut acls: CFArrayRef = std::ptr::null();
+    // SAFETY: `access` is alive for the call; the list is returned owned.
+    let status = unsafe { SecAccessCopyACLList(access.as_CFTypeRef().cast_mut().cast(), &mut acls) };
+    if status != 0 || acls.is_null() {
+        return Vec::new();
+    }
+    // SAFETY: a Copy call's result, owned here.
+    let acls: CFArray<CFType> = unsafe { CFArray::wrap_under_create_rule(acls) };
+    // SAFETY: an immutable constant the framework exports.
+    let partition = unsafe { CFString::wrap_under_get_rule(kSecACLAuthorizationPartitionID) };
+    let mut found = Vec::new();
+    for acl in acls.iter() {
+        let acl = acl.as_CFTypeRef().cast_mut();
+        // SAFETY: `acl` is alive while `acls` is; owned results.
+        let auths = unsafe { SecACLCopyAuthorizations(acl) };
+        if !auths.is_null() {
+            // SAFETY: as above.
+            let auths: CFArray<CFString> = unsafe { CFArray::wrap_under_create_rule(auths) };
+            if auths.iter().any(|a| *a == partition) {
+                continue;
+            }
+        }
+        let (mut apps, mut description, mut prompt): (CFArrayRef, CFStringRef, u16) =
+            (std::ptr::null(), std::ptr::null(), 0);
+        // SAFETY: out-parameters only; each result is owned here.
+        let _ = unsafe { SecACLCopyContents(acl, &mut apps, &mut description, &mut prompt) };
+        let _apps = owned(apps.cast());
+        if let Some(d) = owned(description.cast()).and_then(|d| d.downcast::<CFString>()) {
+            found.push(d.to_string());
+        }
+    }
+    found
 }
 
 /// For rows only: add to `access` what a planter may add before its item exists, an owner entry trusting `owners` and
