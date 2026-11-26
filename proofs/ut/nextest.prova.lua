@@ -106,7 +106,7 @@ spoken_for("a-held-key-is-read-only-by-its-owning-build", {
 	"custody::bundle::an_unsealed_bundle_reads_its_own_entry_fresh_and_a_named_entry_never_sees_the_seal",
 	"access::tests::a_call_this_macos_doesnt_export_is_a_named_refusal",
 	"access::tests::a_partition_entry_reads_as_securityd_writes_it_and_nothing_else",
-	"signer::tests::the_note_alone_fallback_is_said_once_at_warn",
+	"signer::tests::the_note_alone_fallback_and_a_foreign_item_read_past_are_said_once_at_warn",
 })
 spoken_for("a-hand-off-never-leaves-a-key-unheld", {
 	"handoff::tests::a_hand_off_moves_the_value_and_finishes_after_a_cut",

@@ -395,7 +395,11 @@ fn held_with(
                 let key = if matches!(keychain.held(item), Ok(true)) {
                     match read(item) {
                         Ok(key) => key,
-                        Err(refused) => read(&item.next()).map_err(|_| refused)?,
+                        Err(refused) => {
+                            let key = read(&item.next()).map_err(|_| refused)?;
+                            read_past(item, keychain.maker(item).as_deref());
+                            key
+                        }
                     }
                 } else {
                     read(&item.next())?
@@ -493,6 +497,24 @@ fn ours(keychain: &Keychain, item: &Item, made_by: &str) -> bool {
     };
     let made_here = |p: &str| teams.iter().any(|t| t == p) || Some(p) == own_cdhash.as_deref();
     ours_by_access(noted, &listing, keychain.stamps(), me.as_deref(), house, made_here)
+}
+
+/// Said once per item at WARN, the first time a pending hand-off's key is read from `.next` past an item this build
+/// can't read as its own (D m/38646): a foreign item sitting where this build's key belongs is seen, its maker named,
+/// never its value, even when the start goes on.
+fn read_past(item: &Item, maker: Option<&str>) {
+    static SAID: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let key = item.to_string();
+    let mut said = SAID.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if said.contains(&key) {
+        return;
+    }
+    said.push(key);
+    tracing::warn!(
+        item = %item,
+        maker = maker.unwrap_or("not noted"),
+        "a pending hand-off's key is read from its .next, past an item this build can't read as its own"
+    );
 }
 
 /// Said once per process at WARN, the first time [`ours`] reads by the note alone, so a host on that fallback is seen
@@ -938,7 +960,7 @@ mod tests {
 
     /// The note-alone fallback is said at WARN once per process, never again however often it is taken (D m/37770).
     #[test]
-    fn the_note_alone_fallback_is_said_once_at_warn() {
+    fn the_note_alone_fallback_and_a_foreign_item_read_past_are_said_once_at_warn() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
         struct Count(Arc<AtomicUsize>);
@@ -965,6 +987,14 @@ mod tests {
             note_alone("this macOS doesn't export SecTrustedApplicationCopyRequirement");
         });
         assert_eq!(warned.load(Ordering::SeqCst), 1, "said once");
+        let read_past_warned = Arc::new(AtomicUsize::new(0));
+        tracing::subscriber::with_default(Count(read_past_warned.clone()), || {
+            let (a, b) = (item("warn-a"), item("warn-b"));
+            super::read_past(&a, Some("identifier \"elsewhere\""));
+            super::read_past(&a, Some("identifier \"elsewhere\""));
+            super::read_past(&b, None);
+        });
+        assert_eq!(read_past_warned.load(Ordering::SeqCst), 2, "once per item read past");
     }
 
     #[test]
