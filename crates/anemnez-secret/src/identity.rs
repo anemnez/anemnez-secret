@@ -552,16 +552,11 @@ mod macos {
         kSecCSCheckAllArchitectures, kSecCSCheckNestedCode, kSecCSStrictValidate, kSecGuestAttributeAudit,
     };
 
-    // Security.framework, not in security-framework-sys: the signing information of a (running) code, its designated
-    // requirement, and a requirement's text.
+    // Security.framework, not in security-framework-sys: the signing information of a (running) code and its
+    // designated requirement. A requirement's text is crate::access's, its one declaration.
     unsafe extern "C" {
         fn SecCodeCopySigningInformation(code: CFTypeRef, flags: u32, information: *mut CFDictionaryRef) -> i32;
         fn SecCodeCopyDesignatedRequirement(code: CFTypeRef, flags: u32, requirement: *mut SecRequirementRef) -> i32;
-        fn SecRequirementCopyString(
-            requirement: SecRequirementRef,
-            flags: u32,
-            text: *mut core_foundation::string::CFStringRef,
-        ) -> i32;
     }
 
     /// `code`'s designated requirement, as text: strictly valid first (no requirement, no flag loosened), and nothing
@@ -577,16 +572,10 @@ mod macos {
         if status != 0 || requirement.is_null() {
             return Err(format!("its designated requirement cannot be read (OSStatus {status})"));
         }
-        let mut text: core_foundation::string::CFStringRef = std::ptr::null();
-        // SAFETY: a valid +1 requirement; `text` is +1 on success.
-        let status = unsafe { SecRequirementCopyString(requirement, 0, &mut text) };
+        let text = crate::access::printed(requirement.cast());
         // SAFETY: ours (+1), released once.
         unsafe { CFRelease(requirement.cast()) };
-        if status != 0 || text.is_null() {
-            return Err(format!("its designated requirement has no text (OSStatus {status})"));
-        }
-        // SAFETY: a +1 string, owned from here.
-        Ok(unsafe { CFString::wrap_under_create_rule(text) }.to_string())
+        text.map_err(|status| format!("its designated requirement has no text (OSStatus {status})"))
     }
 
     /// Whether this process's running code satisfies `requirement`: for the requirement read's own row.

@@ -38,6 +38,21 @@ is named by a service and an account the product chooses (a per-instance account
 - **The maker is on the item.** `add` never overwrites, and writes `made by: <designated requirement>`
   in the item's comment, which `maker` reads back without the value, so a refusal after a signing
   change says whose item it is.
+- **A signing change is carried across by the access list, never by an edit of it** (F m/37706, D m/37713).
+  Editing an existing item's access list asks for the keychain's password, so an item gains a reader only
+  by being written again, the hand-off way. `add_trusting(item, value, made_by, trusted, table)` writes it
+  trusting exactly `trusted`, and nothing else, this binary included. Each requirement in `trusted` must be
+  one `table` pins to a team it trusts: an Anemnez identifier, anchored at Apple, with the leaf's OU the
+  team, compared as the framework prints it. A leaf CN (a member, not the team), another team, a cdhash, a
+  path or a widened requirement is refused by name, with nothing written. A team build meets its team's
+  requirement, so the build placed now, its successor and a rollback all read the item. `rename` gives the
+  moved item the list of the one it moves, so a `.next` moved into place keeps every reader. `trusts` reads
+  the list back without the value. The comment still names its maker alone, as today's readers expect.
+  Two of the calls it needs, `SecTrustedApplicationCreateFromRequirement` and
+  `SecTrustedApplicationCopyRequirement`, are exported by Security.framework but declared only in its private
+  header. They are never linked: they are resolved at first use by `dlsym`, and a macOS that stops exporting
+  either answers `Trusting::Unsupported`, named, from `add_trusting` and `trusts` alone. No product fails to
+  load, and an ordinary adopt goes on by its note (E m/37742, D m/37740).
 
 <!-- claim: a-hand-off-never-leaves-a-key-unheld -->
 **A key carried across a signing change is held at every step** (from Artichoke's keyring, F). A
@@ -70,9 +85,16 @@ never travels (LADON §3). `signer::adopt(keychain, item, made_by)` answers the 
   item is read back, and a race to make one reads the winner's.
 - **Unavailable never makes one.** A keychain that can't be read now is an error naming the item's maker
   and this build. That holds for a hand-off's `.next` item too: one that can't be read is never taken as
-  no hand-off pending, so nothing is made beside a key that was handed off (F m/37654). Custody's `add` never overwrites, so nothing can be made over it either way.
-- **Another build's item is refused by name.** An item whose `made by:` isn't this build's is refused,
-  naming it. A successor takes a key only by a hand-off, and a hand-off cut short (its `.next` held,
+  no hand-off pending, so nothing is made beside a key that was handed off (F m/37654). Custody's `add`
+  never overwrites, so nothing can be made over it either way.
+- **Another build's item is refused by name.** An item is this build's when every entry on its access list
+  is the house's, and its `made by:` names this build or its list trusts this build's requirement. The
+  house's entries are exactly two kinds, compared as the framework prints a requirement: a requirement the
+  trust table pins to its team, and this build's own designated requirement, which is the creator entry a
+  plain `add` writes (D m/37751). One foreign entry is enough to refuse, whatever the note says: an item's
+  creator is on its list by default and any process may add an item, so a list naming this build beside
+  its planter is a key someone else holds (D m/37713, F m/37745). A list that trusts any application is
+  foreign too. Any other item is refused, naming its maker. A successor takes a key only by a hand-off, and a hand-off cut short (its `.next` held,
   the item not) is finished by `handoff::finish`.
 - **It never prints and never leaves.** The key signs and hands out its public half. Its `Debug` shows
   only the public half, and nothing exports its bytes.

@@ -98,6 +98,9 @@ spoken_for("a-held-key-is-read-only-by-its-owning-build", {
 	"custody::tests::an_item_holds_what_was_put_under_it",
 	"custody::tests::errors_never_say_the_value_and_locked_is_not_not_held",
 	"custody::tests::another_builds_item_reads_unavailable_without_a_dialog",
+	"custody::tests::an_item_carried_across_trusts_its_teams_requirements_alone",
+	"custody::tests::a_rename_keeps_every_requirement_the_item_trusted",
+	"access::tests::a_call_this_macos_doesnt_export_is_a_named_refusal",
 })
 spoken_for("a-hand-off-never-leaves-a-key-unheld", {
 	"handoff::tests::a_hand_off_moves_the_value_and_finishes_after_a_cut",
@@ -132,5 +135,7 @@ spoken_for("a-signing-key-is-made-on-its-host-and-held-by-its-build", {
 	"signer::tests::an_item_that_isnt_a_key_is_refused_by_name",
 	"signer::tests::a_read_never_makes_a_key_and_otherwise_answers_as_adopt_does",
 	"signer::tests::an_unread_next_is_never_read_as_no_hand_off",
+	"signer::tests::a_house_only_access_list_is_this_builds_by_list_or_note_and_one_foreign_entry_refuses_it",
+	"signer::tests::a_planted_item_listing_this_build_beside_its_planter_is_another_builds",
 	"identity::tests::a_process_reads_its_own_designated_requirement",
 })
