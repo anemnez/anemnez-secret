@@ -37,7 +37,7 @@ dependencies = [
 [[package]]
 name = "anemnez-trust"
 version = "0.10.9"
-source = "git+ssh://git@github.com/anemnez/anemnez-extension.git?rev=c9c2aca5685b#c9c2aca5685b17a11599f6f1744ea4e2d8b96726"
+source = "git+ssh://git@github.com/anemnez/anemnez-extension.git?rev=52e4368a8141#52e4368a81419d0771d2ba49c8e86fa798848012"
 
 [[package]]
 name = "base64ct"
