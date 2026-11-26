@@ -389,13 +389,44 @@ impl Keychain {
         trusted: &[&str],
         table: &crate::identity::TrustTable,
     ) -> Result<(), Trusting> {
+        self.add_pinned(item, value, made_by, trusted, table, false)
+    }
+
+    /// [`Self::add_trusting`], with this build's own application entry kept beside the team's requirements (F m/38513,
+    /// D m/38511): the carry's first step, so the build placed now still reads the item when it can't meet a
+    /// requirement judged in full (an unsealed bundle's main executable fails one), and its successor reads it by the
+    /// team's. The requirements are pinned by `table` as [`Self::add_trusting`]'s are; the own entry is this binary
+    /// as the keychain records it, never a name.
+    ///
+    /// # Errors
+    /// As [`Self::add_trusting`].
+    pub fn add_trusting_with_own(
+        &self,
+        item: &Item,
+        value: &Secret,
+        made_by: &str,
+        trusted: &[&str],
+        table: &crate::identity::TrustTable,
+    ) -> Result<(), Trusting> {
+        self.add_pinned(item, value, made_by, trusted, table, true)
+    }
+
+    fn add_pinned(
+        &self,
+        item: &Item,
+        value: &Secret,
+        made_by: &str,
+        trusted: &[&str],
+        table: &crate::identity::TrustTable,
+        with_own: bool,
+    ) -> Result<(), Trusting> {
         if trusted.is_empty() {
             return Err(Trusting::NotTheTeams { item: item.clone(), why: "no requirement to trust".into() });
         }
         for text in trusted {
             crate::access::team_pinned(text, table).map_err(|why| Trusting::NotTheTeams { item: item.clone(), why })?;
         }
-        self.add_listing(item, value, made_by, trusted, false)
+        self.add_listing(item, value, made_by, trusted, with_own)
     }
 
     /// An item trusting `trusted` and, for a row that must read what it wrote, this binary too: never pinned, so
@@ -686,6 +717,10 @@ fn added_with_access(
     };
     if status == 0 { Ok(()) } else { Err(security_framework::base::Error::from_code(status)) }
 }
+
+#[cfg(test)]
+#[path = "custody_bundle_tests.rs"]
+mod bundle;
 
 #[cfg(test)]
 mod tests {

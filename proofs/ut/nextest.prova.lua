@@ -102,6 +102,7 @@ spoken_for("a-held-key-is-read-only-by-its-owning-build", {
 	"custody::tests::a_rename_keeps_every_requirement_the_item_trusted",
 	"custody::tests::a_requirement_prints_as_an_items_list_reads_it",
 	"custody::tests::a_keychain_path_is_absolute_and_its_stamping_follows_where_it_lives",
+	"custody::bundle::an_unsealed_bundle_reads_its_own_entry_fresh_and_a_named_entry_never_sees_the_seal",
 	"access::tests::a_call_this_macos_doesnt_export_is_a_named_refusal",
 	"access::tests::a_partition_entry_reads_as_securityd_writes_it_and_nothing_else",
 	"signer::tests::the_note_alone_fallback_is_said_once_at_warn",

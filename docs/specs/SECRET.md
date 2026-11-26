@@ -46,7 +46,14 @@ is named by a service and an account the product chooses (a per-instance account
   team, compared as the framework prints it. A leaf CN (a member, not the team), another team, a cdhash, a
   path or a widened requirement is refused by name, with nothing written. A team build meets its team's
   requirement, so the build placed now, its successor and a rollback all read the item. `rename` gives the
-  moved item the list of the one it moves, so a `.next` moved into place keeps every reader. `trusts` reads
+  moved item the list of the one it moves, so a `.next` moved into place keeps every reader.
+  `add_trusting_with_own` is the carry's first step (F m/38513, D m/38511): the same pinned requirements, with
+  this build's own application entry kept beside them, so the build placed now reads the item whatever the
+  keychain makes of its requirement, and its successor reads it by the team's. A bundle row holds it from a
+  fresh process: an ad-hoc bundle unsealed after signing reads by its own entry, and another identifier is
+  refused. The same row finds that in a keychain at a path, an entry naming a bundle by identifier admits it
+  sealed or not, so the refusal of a placed, unsealed bundle lies in what no row here can pose (the team's
+  anchor and OU, or the partitions stamped under ~/Library/Keychains) and is proven on a host. `trusts` reads
   the list back without the value. The comment still names its maker alone, as today's readers expect.
   Two of the calls it needs, `SecTrustedApplicationCreateFromRequirement` and
   `SecTrustedApplicationCopyRequirement`, are exported by Security.framework but declared only in its private
