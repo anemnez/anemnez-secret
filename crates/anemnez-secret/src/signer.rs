@@ -301,7 +301,7 @@ fn adopt_or(
 pub fn held(keychain: &Keychain, item: &Item, made_by: &str) -> Result<Option<(SigningKey, Adopted)>, SignerError> {
     let read = match keychain.held(item) {
         Ok(true) => Read::Held { ours: keychain.maker(item).as_deref() == Some(made_by) },
-        Ok(false) => Read::NotHeld { next: matches!(keychain.held(&item.next()), Ok(true)) },
+        Ok(false) => not_held(keychain.held(&item.next()))?,
         Err(CustodyError::Unavailable { .. }) => Read::Unavailable,
         Err(e) => return Err(SignerError::Store(e.to_string())),
     };
@@ -359,6 +359,17 @@ fn write_key(
     Ok((kept, how))
 }
 
+/// Nothing is held under the item: whether a hand-off is pending, by its `.next` item's answer. An answer that isn't one
+/// is never "none pending", which would let [`adopt`] make a key beside one that was handed off (F m/37654): a locked
+/// keychain is Unavailable, as for the item itself, and any other error is the store's.
+fn not_held(next: Result<bool, CustodyError>) -> Result<Read, SignerError> {
+    match next {
+        Ok(next) => Ok(Read::NotHeld { next }),
+        Err(CustodyError::Unavailable { .. }) => Ok(Read::Unavailable),
+        Err(e) => Err(SignerError::Store(e.to_string())),
+    }
+}
+
 /// This build's key from a held item: noted as made by this build, and a key.
 fn held_by(keychain: &Keychain, item: &Item, made_by: &str, secret: &Secret) -> Result<SigningKey, SignerError> {
     let maker = keychain.maker(item);
@@ -407,9 +418,11 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Adopted, Read, SignerError, Step, account, adopt, adopt_existing, adopt_file, held, retire_adopted, step,
+        Adopted, Read, SignerError, Step, account, adopt, adopt_existing, adopt_file, held, not_held, retire_adopted,
+        step,
     };
     use crate::Secret;
+    use crate::custody::CustodyError;
     use crate::custody::{Item, Keychain};
     use ed25519_dalek::Verifier as _;
 
@@ -568,6 +581,19 @@ mod tests {
             matches!(held(&k, &item("node-d"), ME), Err(SignerError::Unavailable { .. })),
             "never None when locked"
         );
+    }
+
+    /// Nothing held under the item, and its `.next` unread: never "no hand-off pending", which would let `adopt` mint
+    /// beside a key that was handed off (F m/37654). A locked keychain is Unavailable, any other error the store's.
+    #[test]
+    fn an_unread_next_is_never_read_as_no_hand_off() {
+        let it = item("node-a");
+        assert_eq!(not_held(Ok(true)).ok(), Some(Read::NotHeld { next: true }));
+        assert_eq!(not_held(Ok(false)).ok(), Some(Read::NotHeld { next: false }));
+        let locked = not_held(Err(CustodyError::Unavailable { item: it.next(), status: -25308 }));
+        assert_eq!(locked.ok(), Some(Read::Unavailable), "a locked .next is Unavailable");
+        let failed = not_held(Err(CustodyError::Store { item: it.next(), status: -25291 }));
+        assert!(matches!(failed, Err(SignerError::Store(_))), "any other error is the store's: {failed:?}");
     }
 
     #[test]

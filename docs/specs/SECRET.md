@@ -69,7 +69,8 @@ never travels (LADON §3). `signer::adopt(keychain, item, made_by)` answers the 
 - **Made once, never remade.** If nothing is held, it is made from the OS's entropy and added. A held
   item is read back, and a race to make one reads the winner's.
 - **Unavailable never makes one.** A keychain that can't be read now is an error naming the item's maker
-  and this build. Custody's `add` never overwrites, so nothing can be made over it either way.
+  and this build. That holds for a hand-off's `.next` item too: one that can't be read is never taken as
+  no hand-off pending, so nothing is made beside a key that was handed off (F m/37654). Custody's `add` never overwrites, so nothing can be made over it either way.
 - **Another build's item is refused by name.** An item whose `made by:` isn't this build's is refused,
   naming it. A successor takes a key only by a hand-off, and a hand-off cut short (its `.next` held,
   the item not) is finished by `handoff::finish`.
