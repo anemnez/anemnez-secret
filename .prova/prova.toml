@@ -89,7 +89,7 @@ must_run    = ["cargo-nextest"]
 must_run = ["cargo"]
 
 [dependencies]
-project-standards = { git = "ssh://git@github.com/anemnez/prova-project-standards.git", tag = "v2.72" }
+project-standards = { git = "ssh://git@github.com/anemnez/prova-project-standards.git", tag = "v2.85" }
 
 # Declare the prova this suite needs, and an older binary says so up front instead of failing
 # mid-run on a feature it does not have. Write `>=`: the value is a semver RANGE, so a bare
