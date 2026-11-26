@@ -283,6 +283,22 @@ fn adopt_or(
     made_by: &str,
     make: impl FnOnce() -> Result<(SigningKey, Adopted), SignerError>,
 ) -> Result<(SigningKey, Adopted), SignerError> {
+    match held(keychain, item, made_by)? {
+        Some(kept) => Ok(kept),
+        None => make(),
+    }
+}
+
+/// The key this build holds under `item`, read and never made: [`adopt`] without its one write of a new key, for a
+/// product that reads its key each time it signs and must never mint there (a key made in a read's place is a new
+/// identity, D m/30267). A hand-off cut short is finished, as [`adopt`] finishes it. `None`: nothing is held and no
+/// hand-off is pending, so the caller reads what it held before custody, or adopts.
+///
+/// It decides from the item's attributes before it opens the value, as [`adopt`] does (G m/15111).
+///
+/// # Errors
+/// [`adopt`]'s refusals: Unavailable, another build's, not a key, the store's own.
+pub fn held(keychain: &Keychain, item: &Item, made_by: &str) -> Result<Option<(SigningKey, Adopted)>, SignerError> {
     let read = match keychain.held(item) {
         Ok(true) => Read::Held { ours: keychain.maker(item).as_deref() == Some(made_by) },
         Ok(false) => Read::NotHeld { next: matches!(keychain.held(&item.next()), Ok(true)) },
@@ -292,7 +308,7 @@ fn adopt_or(
     match step(read) {
         Step::Use => {
             let secret = keychain.get(item).map_err(|e| unavailable(keychain, item, made_by, e))?;
-            Ok((held_by(keychain, item, made_by, &secret)?, Adopted::Held))
+            Ok(Some((held_by(keychain, item, made_by, &secret)?, Adopted::Held)))
         }
         Step::RefuseAnothers => Err(SignerError::AnotherBuilds {
             item: item.clone(),
@@ -302,9 +318,9 @@ fn adopt_or(
         Step::FinishHandOff => {
             handoff::finish(keychain, item, made_by).map_err(SignerError::Store)?;
             let secret = keychain.get(item).map_err(|e| unavailable(keychain, item, made_by, e))?;
-            Ok((held_by(keychain, item, made_by, &secret)?, Adopted::Finished))
+            Ok(Some((held_by(keychain, item, made_by, &secret)?, Adopted::Finished)))
         }
-        Step::Make => make(),
+        Step::Make => Ok(None),
         Step::RefuseUnavailable => Err(SignerError::Unavailable {
             item: item.clone(),
             maker: keychain.maker(item),
@@ -390,7 +406,9 @@ fn hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Adopted, Read, SignerError, Step, account, adopt, adopt_existing, adopt_file, retire_adopted, step};
+    use super::{
+        Adopted, Read, SignerError, Step, account, adopt, adopt_existing, adopt_file, held, retire_adopted, step,
+    };
     use crate::Secret;
     use crate::custody::{Item, Keychain};
     use ed25519_dalek::Verifier as _;
@@ -522,6 +540,34 @@ mod tests {
         assert!(k.held(&it).unwrap_or(false) && !k.held(&it.next()).unwrap_or(true), ".next moved into place");
         let (again, how) = adopt(&k, &it, ME).expect("held");
         assert_eq!((how, again.verifying_key()), (Adopted::Held, key.verifying_key()));
+    }
+
+    /// A read never makes a key: nothing held is `None` and leaves nothing behind, a held key is read as held, a hand-off
+    /// cut short is finished as `adopt` finishes it, and a locked keychain or another build's item is refused as
+    /// `adopt` refuses it. Red when `held` mints where `adopt` would.
+    #[test]
+    fn a_read_never_makes_a_key_and_otherwise_answers_as_adopt_does() {
+        let (_dir, k, path) = keychain();
+        let it = item("node-a");
+        assert!(matches!(held(&k, &it, ME), Ok(None)), "nothing held");
+        assert!(!k.held(&it).unwrap_or(true) && !k.held(&it.next()).unwrap_or(true), "and nothing made");
+        let (made, _) = adopt(&k, &it, ME).expect("made");
+        let (read, how) = held(&k, &it, ME).expect("read").expect("held");
+        assert_eq!((read.verifying_key(), how), (made.verifying_key(), Adopted::Held));
+        let handed = item("node-b");
+        k.add(&handed.next(), &Secret::new(b"44".repeat(32)), ME).expect("the handed-off item");
+        let (_, how) = held(&k, &handed, ME).expect("finished").expect("held");
+        assert_eq!(how, Adopted::Finished);
+        assert!(k.held(&handed).unwrap_or(false) && !k.held(&handed.next()).unwrap_or(true), ".next moved into place");
+        let theirs = item("node-c");
+        k.add(&theirs, &Secret::new(b"55".repeat(32)), OTHER).expect("another build's item");
+        assert!(matches!(held(&k, &theirs, ME), Err(SignerError::AnotherBuilds { .. })));
+        let locked = std::process::Command::new("/usr/bin/security").arg("lock-keychain").arg(&path).status();
+        assert!(locked.is_ok_and(|s| s.success()), "locked");
+        assert!(
+            matches!(held(&k, &item("node-d"), ME), Err(SignerError::Unavailable { .. })),
+            "never None when locked"
+        );
     }
 
     #[test]

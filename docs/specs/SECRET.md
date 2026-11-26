@@ -75,6 +75,10 @@ never travels (LADON §3). `signer::adopt(keychain, item, made_by)` answers the 
   the item not) is finished by `handoff::finish`.
 - **It never prints and never leaves.** The key signs and hands out its public half. Its `Debug` shows
   only the public half, and nothing exports its bytes.
+- **A read never makes one.** `signer::held(keychain, item, made_by)` is `adopt` without its one write of a
+  new key, for a product that reads its key each time it signs: nothing held and no hand-off pending answers
+  `None`, and the caller reads what it held before custody or adopts. Every other case is `adopt`'s, by the same
+  decision, a hand-off cut short finished included.
 - The service, the account and the requirement are the caller's. `<signer>@<node id>` is the default
   account shape, so two hosts hold two keys.
 
