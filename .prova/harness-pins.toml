@@ -1,0 +1,14 @@
+# Each house git pin this repo's Cargo.toml takes, listed with why and owner, so Horai bumps it when its
+# producer releases (M m/38297). Move the pin and its listing together.
+
+[anemnez-clock-family]
+repo = "anemnez/anemnez-clock"
+rev = "dd75fd1661ba"
+why = "the injected clock the custody and signer kernels take (rule 3), the same git copy as anemnez-extension's, so cargo builds one"
+owner = "N"
+
+[anemnez-extension-family]
+repo = "anemnez/anemnez-extension"
+rev = "2cd3fd74f843"
+why = "anemnez-trust, the house's trust table and team id's one home (rule 2), on the same clock as this crate"
+owner = "N"
