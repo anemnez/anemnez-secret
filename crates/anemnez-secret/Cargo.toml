@@ -15,7 +15,7 @@ publish.workspace = true
 anemnez-clock = { git = "ssh://git@github.com/anemnez/anemnez-clock.git", rev = "eabaaf22f8c4", version = "0.1", registry-index = "sparse+http://127.0.0.1:7787/crates/index/" }
 # The house's team id, its one home (rule 2; D m/32487): a crate with no dependencies, MIT OR Apache-2.0, re-exported as
 # identity::ANEMNEZ_TEAM so callers' path stays. Dual form, as anemnez-clock.
-anemnez-trust = { git = "ssh://git@github.com/anemnez/anemnez-extension.git", rev = "72643abf0a99", version = "0.10", registry-index = "sparse+http://127.0.0.1:7787/crates/index/" }
+anemnez-trust = { git = "ssh://git@github.com/anemnez/anemnez-extension.git", rev = "316f69a96b13", version = "0.10", registry-index = "sparse+http://127.0.0.1:7787/crates/index/" }
 # retrust: a private directory for the socket a successor connects to.
 tempfile = "3"
 sha2 = "0.10"
