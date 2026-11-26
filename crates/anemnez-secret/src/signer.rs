@@ -300,7 +300,7 @@ fn adopt_or(
 /// [`adopt`]'s refusals: Unavailable, another build's, not a key, the store's own.
 pub fn held(keychain: &Keychain, item: &Item, made_by: &str) -> Result<Option<(SigningKey, Adopted)>, SignerError> {
     let read = match keychain.held(item) {
-        Ok(true) => Read::Held { ours: keychain.maker(item).as_deref() == Some(made_by) },
+        Ok(true) => Read::Held { ours: ours(keychain, item, made_by) },
         Ok(false) => not_held(keychain.held(&item.next()))?,
         Err(CustodyError::Unavailable { .. }) => Read::Unavailable,
         Err(e) => return Err(SignerError::Store(e.to_string())),
@@ -359,6 +359,39 @@ fn write_key(
     Ok((kept, how))
 }
 
+/// Whether a held item is this build's (D m/37751): every entry on its access list is the house's, and its note names
+/// this build or its list trusts this build's requirement (a signing change carried across, F m/37706). The house's
+/// entries are exactly two kinds: a requirement the trust table pins to its team, and this build's own designated
+/// requirement, the creator entry a plain `add` writes (so every item made before carry-across reads as ours by its
+/// note). A note naming us excuses no foreign entry (F m/37745): an item's creator is on its list by default and any
+/// process may add one. Read off the item's attributes, never its value. A list that can't be read is not this
+/// build's, except on a macOS that doesn't export the call reading a list's requirements: then the note alone, as
+/// before carry-across, so that update breaks the carry-across only, never an ordinary adopt (D m/37740).
+fn ours(keychain: &Keychain, item: &Item, made_by: &str) -> bool {
+    let noted = keychain.maker(item).as_deref() == Some(made_by);
+    let trusted = match keychain.trusts(item) {
+        Ok(trusted) => trusted,
+        Err(crate::custody::Trusting::Unsupported { .. }) => return noted,
+        Err(_) => return false,
+    };
+    let me = crate::access::requirement(made_by).ok();
+    let running = crate::identity::own_requirement().ok().and_then(|r| crate::access::requirement(&r).ok());
+    let table = crate::identity::TrustTable::house();
+    let house = |r: &str| {
+        Some(r) == me.as_deref() || Some(r) == running.as_deref() || crate::access::team_pinned(r, &table).is_ok()
+    };
+    ours_by_access(noted, &trusted, me.as_deref(), house)
+}
+
+/// The access list's half of [`ours`], pure: every entry `house`, and the note naming this build (`noted`) or the list
+/// trusting its requirement (`me`, as the framework prints it). One entry outside the house refuses it, whatever the
+/// note says. An empty list trusts no one.
+fn ours_by_access(noted: bool, trusted: &[String], me: Option<&str>, house: impl Fn(&str) -> bool) -> bool {
+    !trusted.is_empty()
+        && trusted.iter().all(|r| house(r))
+        && (noted || me.is_some_and(|me| trusted.iter().any(|r| r == me)))
+}
+
 /// Nothing is held under the item: whether a hand-off is pending, by its `.next` item's answer. An answer that isn't one
 /// is never "none pending", which would let [`adopt`] make a key beside one that was handed off (F m/37654): a locked
 /// keychain is Unavailable, as for the item itself, and any other error is the store's.
@@ -370,10 +403,11 @@ fn not_held(next: Result<bool, CustodyError>) -> Result<Read, SignerError> {
     }
 }
 
-/// This build's key from a held item: noted as made by this build, and a key.
+/// This build's key from a held item: this build's by [`ours`], read again after the value (a hand-off may have just
+/// moved it), and a key.
 fn held_by(keychain: &Keychain, item: &Item, made_by: &str, secret: &Secret) -> Result<SigningKey, SignerError> {
-    let maker = keychain.maker(item);
-    if maker.as_deref() != Some(made_by) {
+    if !ours(keychain, item, made_by) {
+        let maker = keychain.maker(item);
         return Err(SignerError::AnotherBuilds { item: item.clone(), maker, this_build: made_by.to_owned() });
     }
     parse(item, secret)
@@ -418,8 +452,8 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Adopted, Read, SignerError, Step, account, adopt, adopt_existing, adopt_file, held, not_held, retire_adopted,
-        step,
+        Adopted, Read, SignerError, Step, account, adopt, adopt_existing, adopt_file, held, not_held, ours,
+        ours_by_access, retire_adopted, step,
     };
     use crate::Secret;
     use crate::custody::CustodyError;
@@ -594,6 +628,59 @@ mod tests {
         assert_eq!(locked.ok(), Some(Read::Unavailable), "a locked .next is Unavailable");
         let failed = not_held(Err(CustodyError::Store { item: it.next(), status: -25291 }));
         assert!(matches!(failed, Err(SignerError::Store(_))), "any other error is the store's: {failed:?}");
+    }
+
+    /// The access list's half of `ours`, every case (D m/37713, m/37751): a list of the house's entries alone, this
+    /// build's among them, is this build's; so is one its note names; one foreign entry refuses it, note or not (F
+    /// m/37745); a house list that neither names this build nor is noted as it is not; an empty list is not; an own
+    /// requirement that didn't parse counts only by the note.
+    #[test]
+    fn a_house_only_access_list_is_this_builds_by_list_or_note_and_one_foreign_entry_refuses_it() {
+        let house = |r: &str| r.starts_with("team:") || r == "own";
+        let list = |rs: &[&str]| rs.iter().map(|r| (*r).to_owned()).collect::<Vec<_>>();
+        assert!(ours_by_access(false, &list(&["team:me", "team:before"]), Some("team:me"), house));
+        assert!(ours_by_access(true, &list(&["own"]), Some("team:me"), house), "a plain add's creator entry, noted");
+        assert!(!ours_by_access(false, &list(&["team:me", "cdhash H\"00\""]), Some("team:me"), house), "a planter");
+        assert!(!ours_by_access(true, &list(&["own", "cdhash H\"00\""]), Some("team:me"), house), "noted, planted");
+        assert!(!ours_by_access(true, &list(&["own", "<any application>"]), Some("team:me"), house), "any application");
+        assert!(!ours_by_access(false, &list(&["team:before"]), Some("team:me"), house), "trusted by neither");
+        assert!(!ours_by_access(true, &[], Some("team:me"), house), "an empty list trusts no one");
+        assert!(!ours_by_access(false, &list(&["team:me"]), None, house), "an own requirement that didn't parse");
+    }
+
+    /// On a real keychain (D m/37713, F m/37745): an item listing this build's team requirement beside a code outside
+    /// the house is another build's, its value never read; so is one noted as this build's whose list also trusts a
+    /// foreign requirement; one trusting the team's requirements alone, this build's among them, is this build's by the
+    /// list while its note still names its maker; and a plain add's item is this build's by its note, its creator entry
+    /// the running binary's own.
+    #[test]
+    fn a_planted_item_listing_this_build_beside_its_planter_is_another_builds() {
+        let (_dir, k, _) = keychain();
+        let team = |id: &str| {
+            format!(
+                r#"identifier "{id}" and anchor apple generic and certificate leaf[subject.OU] = "{}""#,
+                crate::identity::ANEMNEZ_TEAM
+            )
+        };
+        let (me, foreign) = (
+            team("ai.anemnez.exampled"),
+            team("ai.anemnez.exampled").replace(crate::identity::ANEMNEZ_TEAM, "ZZZZZZZZZZ"),
+        );
+        let key = Secret::new(b"66".repeat(32));
+        let planted = item("node-a");
+        k.add_trusting_unpinned(&planted, &key, OTHER, &[&me, &foreign], false).expect("planted beside this build");
+        assert!(matches!(held(&k, &planted, &me), Err(SignerError::AnotherBuilds { .. })), "never ours");
+        let noted = item("node-b");
+        k.add_trusting_unpinned(&noted, &key, &me, &[&foreign], true).expect("noted as ours, a foreign reader too");
+        assert!(matches!(held(&k, &noted, &me), Err(SignerError::AnotherBuilds { .. })), "a note excuses nothing");
+        let carried = item("node-c");
+        k.add_trusting(&carried, &key, OTHER, &[&me], &crate::identity::TrustTable::house()).expect("carried across");
+        assert!(ours(&k, &carried, &me), "the team's list names this build");
+        assert_eq!(k.maker(&carried).as_deref(), Some(OTHER), "the note still names its maker");
+        assert!(!ours(&k, &carried, ME), "a build the list doesn't name");
+        let plain = item("node-d");
+        k.add(&plain, &key, ME).expect("a plain add");
+        assert!(ours(&k, &plain, ME), "by its note, its creator entry the running binary's own");
     }
 
     #[test]

@@ -145,6 +145,42 @@ impl std::fmt::Display for CustodyError {
 
 impl std::error::Error for CustodyError {}
 
+/// Why [`Keychain::add_trusting`] wrote nothing.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum Trusting {
+    /// A requirement the trust table doesn't pin to a team it trusts (D m/37713), named with why: nothing written.
+    NotTheTeams { item: Item, why: String },
+    /// This macOS doesn't export a private call the carry-across needs (resolved at first use, never linked; E m/37742),
+    /// named: only making or reading a trusting list fails, nothing else.
+    Unsupported { item: Item, why: String },
+    /// Custody's own refusal.
+    Custody(CustodyError),
+}
+
+impl Trusting {
+    fn of(item: &Item, refused: crate::access::Refused) -> Self {
+        match refused {
+            crate::access::Refused::Unsupported(why) => Self::Unsupported { item: item.clone(), why },
+            crate::access::Refused::Status(status) => Self::Custody(CustodyError::Store { item: item.clone(), status }),
+        }
+    }
+}
+
+impl std::fmt::Display for Trusting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotTheTeams { item, why } => {
+                write!(f, "{item} trusts only its team's builds: {why}; nothing written")
+            }
+            Self::Unsupported { item, why } => write!(f, "{item}: {why}"),
+            Self::Custody(e) => e.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for Trusting {}
+
 /// What [`Keychain::accounts`] found under a service.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Accounts {
@@ -296,6 +332,73 @@ impl Keychain {
     /// The item's comment names `made_by` (the writing build's designated requirement), so a refusal
     /// after a signing change can say whose item it is without reading the value.
     pub fn add(&self, item: &Item, value: &Secret, made_by: &str) -> Result<(), CustodyError> {
+        self.add_with(item, value, made_by, None)
+    }
+
+    /// [`Self::add`], with an access list that trusts exactly `trusted`, each a code requirement that `table` pins to a
+    /// team it trusts under the Anemnez rule (an identifier, anchored at Apple, the leaf's OU the team; D m/37713): a
+    /// signing change carried across, so the build placed now and its successor of another designated requirement, both
+    /// signed by the team, read the one item with no prompt, and a rollback still does (F m/37706). Nothing else is on
+    /// the list, this binary included: a team build meets its team's requirement, and a list custody writes never trusts
+    /// a code outside the team. The comment still names `made_by` alone, as every reader of it today expects; the list
+    /// is read back by [`Self::trusts`]. Editing an existing item's access list asks for the keychain's password, so an
+    /// item gains a reader only by being written again, the hand-off way.
+    ///
+    /// # Errors
+    /// [`Trusting::NotTheTeams`] for a requirement `table` doesn't pin, nothing written; [`Self::add`]'s otherwise.
+    pub fn add_trusting(
+        &self,
+        item: &Item,
+        value: &Secret,
+        made_by: &str,
+        trusted: &[&str],
+        table: &crate::identity::TrustTable,
+    ) -> Result<(), Trusting> {
+        if trusted.is_empty() {
+            return Err(Trusting::NotTheTeams { item: item.clone(), why: "no requirement to trust".into() });
+        }
+        for text in trusted {
+            crate::access::team_pinned(text, table).map_err(|why| Trusting::NotTheTeams { item: item.clone(), why })?;
+        }
+        self.add_listing(item, value, made_by, trusted, false)
+    }
+
+    /// An item trusting `trusted` and, for a row that must read what it wrote, this binary too: never pinned, so
+    /// never outside a test.
+    #[cfg(test)]
+    pub(crate) fn add_trusting_unpinned(
+        &self,
+        item: &Item,
+        value: &Secret,
+        made_by: &str,
+        trusted: &[&str],
+        with_self: bool,
+    ) -> Result<(), Trusting> {
+        self.add_listing(item, value, made_by, trusted, with_self)
+    }
+
+    fn add_listing(
+        &self,
+        item: &Item,
+        value: &Secret,
+        made_by: &str,
+        trusted: &[&str],
+        with_self: bool,
+    ) -> Result<(), Trusting> {
+        let access = crate::access::trusting(&format!("{} / {}", item.service, item.account), trusted, with_self)
+            .map_err(|refused| Trusting::of(item, refused))?;
+        self.add_with(item, value, made_by, Some(&access)).map_err(Trusting::Custody)
+    }
+
+    /// The add every writer here goes through: with `access`, the item's access list is that one, else the default
+    /// (this binary alone).
+    fn add_with(
+        &self,
+        item: &Item,
+        value: &Secret,
+        made_by: &str,
+        access: Option<&core_foundation::base::CFType>,
+    ) -> Result<(), CustodyError> {
         use security_framework::item::{ItemAddOptions, ItemAddValue, ItemClass, Location};
         let data = value.expose(core_foundation::data::CFData::from_buffer);
         let mut add = ItemAddOptions::new(ItemAddValue::Data { class: ItemClass::generic_password(), data });
@@ -306,7 +409,42 @@ impl Keychain {
         if let Some(keychain) = &self.keychain {
             add.set_location(Location::FileKeychain(keychain.clone()));
         }
-        add.add().map_err(|e| Self::error(item, &e))
+        let Some(access) = access else { return add.add().map_err(|e| Self::error(item, &e)) };
+        added_with_access(&add, access).map_err(|e| Self::error(item, &e))
+    }
+
+    /// The code requirements `item`'s access list trusts to read its value, as the framework spells each one (this
+    /// binary's among them), read off the item's reference: its value is never read. What [`Self::add_trusting`] wrote
+    /// is read back by this.
+    ///
+    /// # Errors
+    /// [`Trusting::Unsupported`] on a macOS that doesn't export the call that reads a list's requirements;
+    /// [`CustodyError::NotHeld`], Unavailable for a locked keychain, and the store's own, as [`Trusting::Custody`].
+    pub fn trusts(&self, item: &Item) -> Result<Vec<String>, Trusting> {
+        let found = self.reference(item).map_err(Trusting::Custody)?;
+        let access = crate::access::of(core_foundation::base::TCFType::as_concrete_TypeRef(&found))
+            .map_err(|status| Trusting::Custody(CustodyError::Store { item: item.clone(), status }))?;
+        crate::access::trusted(&access).map_err(|refused| Trusting::of(item, refused))
+    }
+
+    /// `item`'s keychain reference, found by its attributes: the value is never read.
+    fn reference(
+        &self,
+        item: &Item,
+    ) -> Result<security_framework::os::macos::keychain_item::SecKeychainItem, CustodyError> {
+        use security_framework::item::{ItemClass, ItemSearchOptions, Limit, Reference, SearchResult};
+        self.readable(item)?;
+        let mut search = ItemSearchOptions::new();
+        search.class(ItemClass::generic_password()).service(&item.service).account(&item.account).load_refs(true);
+        search.limit(Limit::Max(1));
+        if let Some(keychain) = &self.keychain {
+            search.keychains(std::slice::from_ref(keychain));
+        }
+        let found = search.search().map_err(|e| Self::error(item, &e))?;
+        match found.into_iter().next() {
+            Some(SearchResult::Ref(Reference::KeychainItem(found))) => Ok(found),
+            _ => Err(CustodyError::NotHeld(item.clone())),
+        }
     }
 
     /// The build that made `item`, as its comment names it: read from the item's attributes, never its
@@ -330,10 +468,14 @@ impl Keychain {
     }
 
     /// Move this build's own `from` to `to`: written under `to` (never over an item there), read back,
-    /// and only then is `from` removed, so one of the two always holds the value.
+    /// and only then is `from` removed, so one of the two always holds the value. `to` gets `from`'s access list,
+    /// so a requirement [`Self::add_trusting`] gave `from` is never lost at the move (a hand-off's `.next` moved into
+    /// place keeps every reader it was written for).
     pub fn rename(&self, from: &Item, to: &Item, made_by: &str) -> Result<(), CustodyError> {
         let value = self.get(from)?;
-        self.add(to, &value, made_by)?;
+        let access = crate::access::of(core_foundation::base::TCFType::as_concrete_TypeRef(&self.reference(from)?))
+            .map_err(|status| CustodyError::Store { item: from.clone(), status })?;
+        self.add_with(to, &value, made_by, Some(&access))?;
         let back = self.get(to)?;
         if back.expose(|b| value.expose(|v| b != v)) {
             return Err(CustodyError::Store { item: to.clone(), status: 0 });
@@ -417,6 +559,29 @@ impl Keychain {
     }
 }
 
+/// `add` with `access` as the item's access list (kSecAttrAccess): `security-framework`'s add takes none, so its
+/// dictionary is taken and the access put in beside the rest.
+fn added_with_access(
+    add: &security_framework::item::ItemAddOptions,
+    access: &core_foundation::base::CFType,
+) -> Result<(), security_framework::base::Error> {
+    use core_foundation::base::TCFType as _;
+    use core_foundation::dictionary::CFMutableDictionary;
+    #[allow(deprecated)]
+    let dictionary = add.to_dictionary();
+    let mut dictionary: CFMutableDictionary<core_foundation::base::CFType, core_foundation::base::CFType> =
+        // SAFETY: a fresh mutable copy of a dictionary this side owns, returned owned.
+        unsafe {
+            CFMutableDictionary::wrap_under_create_rule(crate::access::mutable_copy(dictionary.as_concrete_TypeRef()))
+        };
+    dictionary.set(crate::access::attr_access().as_CFType(), access.clone());
+    // SAFETY: a plain add of a dictionary alive for the call; no result is asked for.
+    let status = unsafe {
+        security_framework_sys::keychain_item::SecItemAdd(dictionary.as_concrete_TypeRef(), std::ptr::null_mut())
+    };
+    if status == 0 { Ok(()) } else { Err(security_framework::base::Error::from_code(status)) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Accounts, CustodyError, Item, Keychain};
@@ -429,6 +594,75 @@ mod tests {
         let k =
             Keychain::create_at(&dir.path().join("proof.keychain-db"), "proof-only").expect("a keychain of its own");
         (dir, k)
+    }
+
+    const MAKER: &str = "identifier \"ai.anemnez.exampled\" and anchor apple generic";
+
+    /// The house team's requirement for `identifier`, in the one shape (team-shaped from the trust data, never a
+    /// literal team).
+    fn team(identifier: &str) -> String {
+        format!(
+            r#"identifier "{identifier}" and anchor apple generic and certificate leaf[subject.OU] = "{}""#,
+            crate::identity::ANEMNEZ_TEAM
+        )
+    }
+
+    /// An item carried across trusts exactly its team's requirements, read back off its access list with its value
+    /// never read, and nothing else, this binary included (D m/37713); its comment still names its maker alone. Any
+    /// requirement the trust table doesn't pin to its team is refused by name, nothing written: a leaf CN (a member,
+    /// not the team), another team, a cdhash, no identifier, or an identifier outside the house.
+    #[test]
+    fn an_item_carried_across_trusts_its_teams_requirements_alone() {
+        let (_dir, k) = keychain();
+        let house = crate::identity::TrustTable::house();
+        let item = Item::new("ai.anemnez.example.role", "promoter@node");
+        let (now, next) = (team("ai.anemnez.exampled"), team("ai.anemnez.example-app"));
+        k.add_trusting(&item, &Secret::new(VALUE.as_bytes().to_vec()), MAKER, &[&now, &next], &house).expect("made");
+        let printed = |r: &str| crate::access::requirement(r).expect("parses");
+        let mut want = vec![printed(&now), printed(&next)];
+        want.sort();
+        assert_eq!(k.trusts(&item).expect("its access list reads"), want, "the team's two, and nothing else");
+        assert_eq!(k.maker(&item).as_deref(), Some(MAKER), "the note names the maker alone");
+        let plain = Item::new("ai.anemnez.example.role", "plain@node");
+        k.add(&plain, &Secret::new(VALUE.as_bytes().to_vec()), MAKER).expect("made");
+        assert!(!k.trusts(&plain).expect("reads").contains(&printed(&now)), "a plain add trusts this binary alone");
+        let refused = [
+            "identifier \"ai.anemnez.exampled\" and anchor apple generic and certificate leaf[subject.CN] = \"Apple Development: A Member (ABCDE12345)\"".to_owned(),
+            team("ai.anemnez.exampled").replace(crate::identity::ANEMNEZ_TEAM, "ZZZZZZZZZZ"),
+            "cdhash H\"0123456789abcdef0123456789abcdef01234567\"".to_owned(),
+            format!("anchor apple generic and certificate leaf[subject.OU] = \"{}\"", crate::identity::ANEMNEZ_TEAM),
+            team("com.example.elsewhere"),
+            format!("{} or anchor apple generic", team("ai.anemnez.exampled")),
+            "not a requirement (".to_owned(),
+        ];
+        for (n, bad) in refused.iter().enumerate() {
+            let it = Item::new("ai.anemnez.example.role", format!("bad-{n}@node"));
+            let got = k.add_trusting(&it, &Secret::new(VALUE.as_bytes().to_vec()), MAKER, &[&now, bad], &house);
+            assert!(matches!(got, Err(super::Trusting::NotTheTeams { .. })), "{bad}: {got:?}");
+            assert!(!k.held(&it).expect("reads"), "{bad}: nothing written");
+        }
+        assert!(matches!(
+            k.trusts(&Item::new("ai.anemnez.example.role", "none@node")),
+            Err(super::Trusting::Custody(CustodyError::NotHeld(_)))
+        ));
+    }
+
+    /// A rename keeps the access list: a hand-off's `.next` written trusting the team's requirement, moved into place,
+    /// still trusts it (F m/37706: a move that took the default list would drop it). Red with rename's plain add. This
+    /// binary is on the list only so the row can read what it moves.
+    #[test]
+    fn a_rename_keeps_every_requirement_the_item_trusted() {
+        let (_dir, k) = keychain();
+        let item = Item::new("ai.anemnez.example.role", "promoter@node");
+        let now = team("ai.anemnez.exampled");
+        k.add_trusting_unpinned(&item.next(), &Secret::new(VALUE.as_bytes().to_vec()), MAKER, &[&now], true)
+            .expect("made");
+        let before = k.trusts(&item.next()).expect("reads");
+        k.rename(&item.next(), &item, MAKER).expect("moved into place");
+        assert_eq!(k.trusts(&item).expect("reads"), before, "every requirement survives the move");
+        assert!(before.contains(&crate::access::requirement(&now).expect("parses")));
+        assert!(!k.held(&item.next()).expect("reads"), ".next is gone");
+        assert_eq!(k.get(&item).expect("reads").expose(|v| v.to_vec()), VALUE.as_bytes());
     }
 
     /// `SECRET.md#a-held-key-is-read-only-by-its-owning-build`: what was put under an item is what

@@ -11,6 +11,8 @@
 //!   may do (the one place a code signature is judged).
 
 #[cfg(target_os = "macos")]
+mod access;
+#[cfg(target_os = "macos")]
 pub mod custody;
 // handoff and retrust ship as a pair: a hand-off's successor is the child retrust has checked by its
 // audit token (D, 2026-11-06).
