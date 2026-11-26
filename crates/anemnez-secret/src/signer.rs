@@ -386,10 +386,21 @@ fn held_with(
         Step::FinishHandOff => match confirm {
             // No other reader: never finished on this process's own read-back (D m/38588, MB16's path). The key is
             // read from whichever item this build reads, and the pair is left as it is.
+            // Item first, then `.next`: refused only when neither reads as this build's key (D m/38621).
             None => {
-                let from = if matches!(keychain.held(item), Ok(true)) { item.clone() } else { item.next() };
-                let secret = keychain.get(&from).map_err(|e| unavailable(keychain, &from, made_by, e))?;
-                Ok(Some((held_by(keychain, &from, made_by, &secret)?, Adopted::HandOffPending)))
+                let read = |from: &Item| {
+                    let secret = keychain.get(from).map_err(|e| unavailable(keychain, from, made_by, e))?;
+                    held_by(keychain, from, made_by, &secret)
+                };
+                let key = if matches!(keychain.held(item), Ok(true)) {
+                    match read(item) {
+                        Ok(key) => key,
+                        Err(refused) => read(&item.next()).map_err(|_| refused)?,
+                    }
+                } else {
+                    read(&item.next())?
+                };
+                Ok(Some((key, Adopted::HandOffPending)))
             }
             Some(confirm) => {
                 match handoff::finish_confirmed(keychain, item, made_by, confirm).map_err(SignerError::Store)? {
@@ -751,7 +762,7 @@ mod tests {
     /// make a key in its place.
     #[test]
     fn a_start_that_meets_a_pending_next_leaves_both() {
-        let (_dir, k, _) = keychain();
+        let (_dir, k, path) = keychain();
         let public = ed25519_dalek::SigningKey::from_bytes(&[0x22; 32]).verifying_key();
         let alone = item("node-a");
         k.add(&alone.next(), &Secret::new(b"22".repeat(32)), ME).expect("the handed-off item");
@@ -767,6 +778,18 @@ mod tests {
         let (key, how) = held(&k, &both, ME).expect("read").expect("held");
         assert_eq!((how, key.verifying_key()), (Adopted::HandOffPending, public));
         assert!(k.held(&both.next()).unwrap_or(false) && k.held(&both).unwrap_or(false), "both left");
+        // An item held but unreadable to this build (another tool made it) beside this build's .next: the key is read
+        // from .next, never refused while one of the pair reads (D m/38621).
+        let unreadable = item("node-c");
+        k.add(&unreadable.next(), &Secret::new(b"22".repeat(32)), ME).expect("the handed-off item");
+        let made = std::process::Command::new("/usr/bin/security")
+            .args(["add-generic-password", "-s", &unreadable.service, "-a", &unreadable.account, "-w", "not-ours"])
+            .arg(&path)
+            .status();
+        assert!(made.is_ok_and(|s| s.success()), "an item this build can't read");
+        let (key, how) = held(&k, &unreadable, ME).expect("read from .next").expect("held");
+        assert_eq!((how, key.verifying_key()), (Adopted::HandOffPending, public));
+        assert!(k.held(&unreadable.next()).unwrap_or(false) && k.held(&unreadable).unwrap_or(false), "both left");
     }
 
     /// A read never makes a key: nothing held is `None` and leaves nothing behind, a held key is read as held, a hand-off

@@ -606,9 +606,9 @@ impl Keychain {
     }
 
     /// Move this build's own `from` to `to`, `from` removed once this writer's own read-back reads `to`
-    /// ([`WritersOwnRead`]): [`Self::rename_confirmed`] with no other reader, for a move whose next reader is this same
-    /// build (fabricd's seal retiring its own key). A carry, whose next reader is another build, takes
-    /// [`Self::rename_confirmed`].
+    /// ([`WritersOwnRead`]): [`Self::rename_confirmed`] with no other reader. Only where the writer's build is the
+    /// item's only reader (E m/38620): then the writer's read-back is the reader's path (fabricd's seal retiring its
+    /// own key). Anywhere another build reads the item next (a carry), take [`Self::rename_confirmed`].
     ///
     /// # Errors
     /// As [`Self::rename_confirmed`]; a move its own read-back didn't confirm is the store's, both kept.
