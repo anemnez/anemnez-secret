@@ -569,8 +569,9 @@ impl Keychain {
     /// place keeps every reader it was written for).
     pub fn rename(&self, from: &Item, to: &Item, made_by: &str) -> Result<(), CustodyError> {
         let value = self.get(from)?;
-        let access = crate::access::of(core_foundation::base::TCFType::as_concrete_TypeRef(&self.reference(from)?))
-            .map_err(|status| CustodyError::Store { item: from.clone(), status })?;
+        let access =
+            crate::access::of_for_writing(core_foundation::base::TCFType::as_concrete_TypeRef(&self.reference(from)?))
+                .map_err(|status| CustodyError::Store { item: from.clone(), status })?;
         self.add_with(to, &value, made_by, Some(&access))?;
         let back = self.get(to)?;
         if back.expose(|b| value.expose(|v| b != v)) {
@@ -851,6 +852,61 @@ mod tests {
         assert!(before.contains(&crate::access::requirement(&now).expect("parses")));
         assert!(!k.held(&item.next()).expect("reads"), ".next is gone");
         assert_eq!(k.get(&item).expect("reads").expose(|v| v.to_vec()), VALUE.as_bytes());
+    }
+
+    /// A rename never copies the partitions stamped on the item it moves (F m/38557): securityd stamps the item's
+    /// creator itself, and an add that sets a partition entry asks for the keychain's password where securityd stamps,
+    /// so a copied stamp failed MB16's move with -25293 and dialogs off. The readers survive the move; the planted
+    /// stamp doesn't.
+    #[test]
+    fn a_rename_moves_the_readers_and_never_the_partitions() {
+        let (_dir, k) = keychain();
+        let item = Item::new("ai.anemnez.example.role", "promoter@node");
+        let now = team("ai.anemnez.exampled");
+        let planted =
+            super::Planted { trusted: &[&now], with_self: true, owners: &[], partitions: &["teamid:ZZZZZZZZZZ"] };
+        k.add_planted(&item.next(), &Secret::new(VALUE.as_bytes().to_vec()), MAKER, &planted).expect("made");
+        assert!(k.listing(&item.next()).expect("reads").partitions.contains(&"teamid:ZZZZZZZZZZ".to_owned()), "posed");
+        let readers = k.listing(&item.next()).expect("reads").readers;
+        k.rename(&item.next(), &item, MAKER).expect("moved into place");
+        let moved = k.listing(&item).expect("reads");
+        assert_eq!(moved.readers, readers, "every reader survives the move");
+        assert!(
+            moved.partitions.is_empty(),
+            "no stamp is copied, and a path keychain stamps none: {:?}",
+            moved.partitions
+        );
+        assert_eq!(k.get(&item).expect("reads").expose(|v| v.to_vec()), VALUE.as_bytes());
+    }
+
+    /// By hand only (it makes, then deletes, a keychain file of its own under ~/Library/Keychains, where securityd
+    /// stamps; never the login keychain): the move F's MB16 carry failed (F m/38557). `.next` trusts this binary by
+    /// requirement alone, as a team-only list trusts the placed build, and is stamped with this binary's partition.
+    /// The rename's add was refused -25293 while the stamp was copied; now the moved item reads, stamped afresh.
+    #[test]
+    #[ignore = "by hand: a scratch keychain under ~/Library/Keychains, where securityd stamps"]
+    fn a_rename_in_a_stamped_keychain_is_stamped_afresh_never_refused() {
+        let home = super::home().expect("a home");
+        let path = home.join(format!("Library/Keychains/anemnez-proof-{}.keychain-db", std::process::id()));
+        let k = Keychain::create_at(&path, "proof-only").expect("a keychain of its own");
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert!(k.stamps(), "securityd stamps here");
+            let me = crate::identity::own_requirement().expect("this binary's requirement");
+            let item = Item::new("ai.anemnez.example.role", "promoter@node");
+            k.add_trusting_unpinned(&item.next(), &Secret::new(VALUE.as_bytes().to_vec()), MAKER, &[&me], false)
+                .expect("made");
+            let stamped = k.listing(&item.next()).expect("reads").partitions;
+            assert_eq!(stamped.len(), 1, "the creator's stamp: {stamped:?}");
+            k.rename(&item.next(), &item, MAKER).expect("moved into place, never refused");
+            assert_eq!(k.listing(&item).expect("reads").partitions, stamped, "stamped afresh, as the mover");
+            assert_eq!(k.get(&item).expect("reads").expose(|v| v.to_vec()), VALUE.as_bytes());
+        }));
+        drop(k);
+        let _ = std::process::Command::new("/usr/bin/security").arg("delete-keychain").arg(&path).status();
+        assert!(!path.exists(), "the scratch keychain is gone");
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     /// `SECRET.md#a-held-key-is-read-only-by-its-owning-build`: what was put under an item is what

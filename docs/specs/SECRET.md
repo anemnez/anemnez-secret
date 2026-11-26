@@ -46,7 +46,11 @@ is named by a service and an account the product chooses (a per-instance account
   team, compared as the framework prints it. A leaf CN (a member, not the team), another team, a cdhash, a
   path or a widened requirement is refused by name, with nothing written. A team build meets its team's
   requirement, so the build placed now, its successor and a rollback all read the item. `rename` gives the
-  moved item the list of the one it moves, so a `.next` moved into place keeps every reader.
+  moved item the list of the one it moves, so a `.next` moved into place keeps every reader. It never copies
+  the partitions stamped on the item it moves: securityd stamps the new item's creator itself, and an add that
+  sets a partition entry asks for the keychain's password wherever securityd stamps, so a copied stamp was
+  refused -25293 with dialogs off on MB16's carry (F m/38557). A by-hand row poses it in a scratch keychain
+  under ~/Library/Keychains, where securityd stamps; a path row holds that a planted stamp never moves.
   `add_trusting_with_own` is the carry's first step (F m/38513, D m/38511): the same pinned requirements, with
   this build's own application entry kept beside them, so the build placed now reads the item whatever the
   keychain makes of its requirement, and its successor reads it by the team's. A bundle row holds it from a

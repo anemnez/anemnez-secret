@@ -41,6 +41,7 @@ unsafe extern "C" {
         prompt: *mut u16,
     ) -> OSStatus;
     fn SecACLCopyAuthorizations(acl: SecAclRef) -> CFArrayRef;
+    fn SecACLRemove(acl: SecAclRef) -> OSStatus;
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -243,6 +244,41 @@ pub(crate) fn of(item: SecKeychainItemRef) -> Result<CFType, OSStatus> {
     // SAFETY: `item` is a live reference the caller holds; the access is returned owned.
     let status = unsafe { SecKeychainItemCopyAccess(item, &mut access) };
     owned(access.cast()).filter(|_| status == 0).ok_or(status)
+}
+
+/// `item`'s access list for writing another item: its entries without the `partition_id` ones (F m/38557). securityd
+/// stamps the new item's creator itself, and an add that sets a partition entry asks for the keychain's password
+/// wherever securityd stamps (under ~/Library/Keychains), so a copied stamp is refused there with dialogs off.
+pub(crate) fn of_for_writing(item: SecKeychainItemRef) -> Result<CFType, OSStatus> {
+    let access = of(item)?;
+    let mut acls: CFArrayRef = std::ptr::null();
+    // SAFETY: `access` is alive for the call; the list is returned owned.
+    let status = unsafe { SecAccessCopyACLList(access.as_CFTypeRef().cast_mut().cast(), &mut acls) };
+    if status != 0 || acls.is_null() {
+        return Err(status);
+    }
+    // SAFETY: a Copy call's result, owned here.
+    let acls: CFArray<CFType> = unsafe { CFArray::wrap_under_create_rule(acls) };
+    // SAFETY: an immutable CFString constant the framework exports.
+    let partition = unsafe { CFString::wrap_under_get_rule(kSecACLAuthorizationPartitionID) };
+    for acl in acls.iter() {
+        let acl = acl.as_CFTypeRef().cast_mut();
+        // SAFETY: `acl` is alive while `acls` is; the list is returned owned (a Copy call).
+        let auths = unsafe { SecACLCopyAuthorizations(acl) };
+        if auths.is_null() {
+            continue;
+        }
+        // SAFETY: as above.
+        let auths: CFArray<CFString> = unsafe { CFArray::wrap_under_create_rule(auths) };
+        if auths.iter().any(|a| *a == partition) {
+            // SAFETY: `acl` belongs to `access`, a copy this call owns; removing it edits that copy alone.
+            let status = unsafe { SecACLRemove(acl) };
+            if status != 0 {
+                return Err(status);
+            }
+        }
+    }
+    Ok(access)
 }
 
 /// What an item's access list says, read off the item, never its value: who may read the value (its decrypt entries),

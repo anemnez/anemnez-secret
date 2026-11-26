@@ -100,6 +100,7 @@ spoken_for("a-held-key-is-read-only-by-its-owning-build", {
 	"custody::tests::another_builds_item_reads_unavailable_without_a_dialog",
 	"custody::tests::an_item_carried_across_trusts_its_teams_requirements_alone",
 	"custody::tests::a_rename_keeps_every_requirement_the_item_trusted",
+	"custody::tests::a_rename_moves_the_readers_and_never_the_partitions",
 	"custody::tests::a_requirement_prints_as_an_items_list_reads_it",
 	"custody::tests::a_keychain_path_is_absolute_and_its_stamping_follows_where_it_lives",
 	"custody::bundle::an_unsealed_bundle_reads_its_own_entry_fresh_and_a_named_entry_never_sees_the_seal",
