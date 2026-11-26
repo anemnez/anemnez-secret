@@ -12,6 +12,8 @@ use security_framework::os::macos::keychain::{CreateOptions, SecKeychain};
 use security_framework::os::macos::passwords::find_generic_password;
 
 use crate::Secret;
+pub use crate::access::Listing;
+use std::os::unix::ffi::OsStrExt as _;
 
 /// Keychain dialogs. A non-interactive [`Keychain`] (every constructor but [`Keychain::login_interactive`])
 /// turns them off for the process when it is made, and nothing here turns them on again: an item whose
@@ -145,6 +147,27 @@ impl std::fmt::Display for CustodyError {
 
 impl std::error::Error for CustodyError {}
 
+/// What a row plants: who the list trusts (and this binary), its owners, and its partitions.
+#[cfg(test)]
+pub(crate) struct Planted<'a> {
+    pub trusted: &'a [&'a str],
+    pub with_self: bool,
+    pub owners: &'a [&'a str],
+    pub partitions: &'a [&'a str],
+}
+
+/// `text` as the framework prints a code requirement: the spelling [`Keychain::trusts`] and [`Listing`] use, so a
+/// caller compares a requirement it holds with an item's list without a printer of its own (F m/37818).
+///
+/// # Errors
+/// [`Trusting::NotTheTeams`] naming `text` when it is no code requirement.
+pub fn printed_requirement(text: &str) -> Result<String, Trusting> {
+    crate::access::requirement(text).map_err(|status| Trusting::NotTheTeams {
+        item: Item::new("", ""),
+        why: format!("'{text}' is no code requirement (OSStatus {status})"),
+    })
+}
+
 /// Why [`Keychain::add_trusting`] wrote nothing.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -198,6 +221,8 @@ pub struct Accounts {
 pub struct Keychain {
     /// None: the user's default keychain (the login keychain).
     keychain: Option<SecKeychain>,
+    /// Whether securityd stamps this keychain's items with their creator's partition: by where its file lives.
+    stamped: bool,
 }
 
 impl Keychain {
@@ -205,7 +230,7 @@ impl Keychain {
     /// on. Never in a test: tests use [`Keychain::create_at`].
     pub fn login() -> Self {
         quiet::off();
-        Self { keychain: None }
+        Self { keychain: None, stamped: true }
     }
 
     /// The user's default keychain WITH dialogs, for a command a person runs at the Mac (an explicit
@@ -213,25 +238,27 @@ impl Keychain {
     /// process that has already made a non-interactive Keychain.
     pub fn login_interactive() -> Result<Self, String> {
         quiet::on()?;
-        Ok(Self { keychain: None })
+        Ok(Self { keychain: None, stamped: true })
     }
 
     /// A keychain file of its own at `path`, made with `password` (proofs: never the login keychain).
     /// Non-interactive, as [`Keychain::login`].
     pub fn create_at(path: &std::path::Path, password: &str) -> Result<Self, String> {
+        absolute(path)?;
         let mut keychain = CreateOptions::new().password(password).create(path).map_err(|e| e.to_string())?;
         keychain.unlock(Some(password)).map_err(|e| e.to_string())?;
         quiet::off();
-        Ok(Self { keychain: Some(keychain) })
+        Ok(Self { keychain: Some(keychain), stamped: stamped_at(path, home().as_deref()) })
     }
 
     /// An existing keychain file at `path`, unlocked with `password` (a proof's successor opens the
     /// file its holder made). Non-interactive, as [`Keychain::login`].
     pub fn open_at(path: &std::path::Path, password: &str) -> Result<Self, String> {
+        absolute(path)?;
         let mut keychain = SecKeychain::open(path).map_err(|e| e.to_string())?;
         keychain.unlock(Some(password)).map_err(|e| e.to_string())?;
         quiet::off();
-        Ok(Self { keychain: Some(keychain) })
+        Ok(Self { keychain: Some(keychain), stamped: stamped_at(path, home().as_deref()) })
     }
 
     /// Unavailable for `item` when the keychain is locked (or its state can't be read): an attribute search
@@ -307,6 +334,14 @@ impl Keychain {
         }
     }
 
+    /// Whether this keychain's items are judged as stamped with their creator's partition, by where its file lives (D
+    /// m/37833): securityd stamps every item under the user's `Library/Keychains`, the login keychain's included, and
+    /// nothing elsewhere (read by value, 2026-11-26). So a keychain opened by its path there gets the full check, and one
+    /// outside it, a test's, needs no stamp. Where items are stamped, an item with none is refused.
+    pub(crate) fn stamps(&self) -> bool {
+        self.stamped
+    }
+
     /// The value under `item`.
     pub fn get(&self, item: &Item) -> Result<Secret, CustodyError> {
         let keychains = self.keychains();
@@ -377,6 +412,27 @@ impl Keychain {
         self.add_listing(item, value, made_by, trusted, with_self)
     }
 
+    /// For rows only: an item as a planter would make it, its list trusting `planted.trusted` (and this binary,
+    /// `planted.with_self`), with an owner entry and a partition entry added before the add.
+    #[cfg(test)]
+    pub(crate) fn add_planted(
+        &self,
+        item: &Item,
+        value: &Secret,
+        made_by: &str,
+        planted: &Planted<'_>,
+    ) -> Result<(), Trusting> {
+        let access = crate::access::trusting(
+            &format!("{} / {}", item.service, item.account),
+            planted.trusted,
+            planted.with_self,
+        )
+        .map_err(|refused| Trusting::of(item, refused))?;
+        crate::access::plant(&access, planted.owners, planted.partitions)
+            .map_err(|refused| Trusting::of(item, refused))?;
+        self.add_with(item, value, made_by, Some(&access)).map_err(Trusting::Custody)
+    }
+
     fn add_listing(
         &self,
         item: &Item,
@@ -421,10 +477,19 @@ impl Keychain {
     /// [`Trusting::Unsupported`] on a macOS that doesn't export the call that reads a list's requirements;
     /// [`CustodyError::NotHeld`], Unavailable for a locked keychain, and the store's own, as [`Trusting::Custody`].
     pub fn trusts(&self, item: &Item) -> Result<Vec<String>, Trusting> {
+        self.listing(item).map(|listing| listing.readers)
+    }
+
+    /// `item`'s whole access list as a [`Listing`]: who reads its value, who may change the list, and the partitions
+    /// that say which code made it, read off the item's reference, never its value (D m/37792).
+    ///
+    /// # Errors
+    /// As [`Self::trusts`].
+    pub fn listing(&self, item: &Item) -> Result<Listing, Trusting> {
         let found = self.reference(item).map_err(Trusting::Custody)?;
         let access = crate::access::of(core_foundation::base::TCFType::as_concrete_TypeRef(&found))
             .map_err(|status| Trusting::Custody(CustodyError::Store { item: item.clone(), status }))?;
-        crate::access::trusted(&access).map_err(|refused| Trusting::of(item, refused))
+        crate::access::listing(&access).map_err(|refused| Trusting::of(item, refused))
     }
 
     /// `item`'s keychain reference, found by its attributes: the value is never read.
@@ -559,6 +624,46 @@ impl Keychain {
     }
 }
 
+/// A keychain path must be absolute: a relative one is created, or looked for, in the user's `Library/Keychains`, so a
+/// row or a tool that names one writes into the person's own (E m/37831; it happened, 2026-11-26).
+fn absolute(path: &std::path::Path) -> Result<(), String> {
+    if path.is_absolute() {
+        Ok(())
+    } else {
+        Err(format!(
+            "give an absolute keychain path: a relative one ({}) is created in ~/Library/Keychains",
+            path.display()
+        ))
+    }
+}
+
+/// Whether securityd stamps a keychain at `path`: under `home`'s `Library/Keychains`, compared by components after
+/// resolving what exists of it, never by text.
+fn stamped_at(path: &std::path::Path, home: Option<&std::path::Path>) -> bool {
+    let Some(home) = home else { return false };
+    let under = home.join("Library").join("Keychains");
+    let under = under.canonicalize().unwrap_or(under);
+    let resolved = match path.parent().map(std::path::Path::canonicalize) {
+        Some(Ok(dir)) => dir.join(path.file_name().unwrap_or_default()),
+        // What can't be resolved is judged as spelled, and a `..` in it is never under anything.
+        _ if path.components().any(|c| c == std::path::Component::ParentDir) => return false,
+        _ => path.to_path_buf(),
+    };
+    resolved.starts_with(&under)
+}
+
+/// This user's home directory, as the user database has it (never `$HOME`, which a caller may set).
+fn home() -> Option<std::path::PathBuf> {
+    // SAFETY: getpwuid returns a pointer into static storage or null; it is read at once, on this thread.
+    let entry = unsafe { libc::getpwuid(libc::getuid()) };
+    if entry.is_null() {
+        return None;
+    }
+    // SAFETY: a non-null entry's pw_dir is a NUL-terminated string while the entry lives.
+    let dir = unsafe { std::ffi::CStr::from_ptr((*entry).pw_dir) };
+    Some(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes())))
+}
+
 /// `add` with `access` as the item's access list (kSecAttrAccess): `security-framework`'s add takes none, so its
 /// dictionary is taken and the access put in beside the rest.
 fn added_with_access(
@@ -645,6 +750,54 @@ mod tests {
             k.trusts(&Item::new("ai.anemnez.example.role", "none@node")),
             Err(super::Trusting::Custody(CustodyError::NotHeld(_)))
         ));
+    }
+
+    /// A keychain path is absolute or refused by name, nothing made (E m/37831): a relative one would be created in
+    /// the person's own Library/Keychains. Whether its items are stamped follows where it lives (D m/37833): under the
+    /// user's Library/Keychains yes, anywhere else no, and a path that only spells those words is not under it.
+    #[test]
+    fn a_keychain_path_is_absolute_and_its_stamping_follows_where_it_lives() {
+        // The guard first, so a broken one fails here and never creates a keychain in the person's Library.
+        assert!(super::absolute(std::path::Path::new("relative.keychain-db")).is_err(), "a relative path");
+        assert!(super::absolute(std::path::Path::new("/tmp/x.keychain-db")).is_ok(), "an absolute one");
+        for refused in [
+            Keychain::create_at(std::path::Path::new("relative.keychain-db"), "proof-only").err(),
+            Keychain::open_at(std::path::Path::new("relative.keychain-db"), "proof-only").err(),
+        ] {
+            let why = refused.expect("refused");
+            assert!(why.contains("give an absolute keychain path"), "{why}");
+        }
+        let home = std::path::Path::new("/Users/someone");
+        assert!(super::stamped_at(std::path::Path::new("/Users/someone/Library/Keychains/x.keychain-db"), Some(home)));
+        assert!(!super::stamped_at(std::path::Path::new("/tmp/x/x.keychain-db"), Some(home)));
+        assert!(!super::stamped_at(
+            std::path::Path::new("/tmp/Users/someone/Library/Keychains/x.keychain-db"),
+            Some(home)
+        ));
+        assert!(
+            !super::stamped_at(
+                std::path::Path::new("/Users/someone/Library/Keychains/../../x.keychain-db"),
+                Some(home)
+            ),
+            "never by text"
+        );
+        assert!(!super::stamped_at(std::path::Path::new("/Users/someone/Library/Keychains/x.keychain-db"), None));
+        let (_dir, k) = keychain();
+        assert!(!k.stamps(), "a test's keychain, under a temporary directory");
+        assert!(Keychain::login().stamps(), "the login keychain");
+    }
+
+    /// A requirement prints as the framework prints it, so a caller compares it with an item's list without a printer
+    /// of its own (F m/37818): the house shape round-trips to what `trusts` reads back, and text that isn't one is refused.
+    #[test]
+    fn a_requirement_prints_as_an_items_list_reads_it() {
+        let (_dir, k) = keychain();
+        let item = Item::new("ai.anemnez.example.role", "printed@node");
+        let now = team("ai.anemnez.exampled");
+        let house = crate::identity::TrustTable::house();
+        k.add_trusting(&item, &Secret::new(VALUE.as_bytes().to_vec()), MAKER, &[&now], &house).expect("made");
+        assert_eq!(k.trusts(&item).expect("reads"), vec![super::printed_requirement(&now).expect("prints")]);
+        assert!(matches!(super::printed_requirement("not a requirement ("), Err(super::Trusting::NotTheTeams { .. })));
     }
 
     /// A rename keeps the access list: a hand-off's `.next` written trusting the team's requirement, moved into place,

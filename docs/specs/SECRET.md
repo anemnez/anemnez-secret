@@ -96,7 +96,24 @@ never travels (LADON §3). `signer::adopt(keychain, item, made_by)` answers the 
   plain `add` writes (D m/37751). One foreign entry is enough to refuse, whatever the note says: an item's
   creator is on its list by default and any process may add an item, so a list naming this build beside
   its planter is a key someone else holds (D m/37713, F m/37745). A list that trusts any application is
-  foreign too. Any other item is refused, naming its maker. A successor takes a key only by a hand-off, and a hand-off cut short (its `.next` held,
+  foreign too, as is an entry whose requirement can't be read.
+  The owner entry (who may change the list) must be empty, which means the person alone with the keychain
+  password, as every item custody writes leaves it, or the house's. Every partition the item carries must
+  be the house's: `teamid:<a team the trust table trusts>`, or `cdhash:<this binary's own>` only when this
+  binary has no team. securityd stamps the real creator's partition on every item in the login keychain,
+  and a planter can add a partition beside it but never remove it. So a planted item is refused even when
+  it lists only us under our note with a value its planter chose (F m/37773, D m/37792). So is one made
+  by `security add-generic-password` (`apple-tool:`); a person re-makes a key through the product's own
+  verb. securityd stamps every item under the user's `Library/Keychains` (the login keychain's
+  included) and nothing elsewhere, so whether a stamp is required follows where the keychain file lives,
+  never how it was opened (D m/37833). Under `Library/Keychains` an item with no stamp is refused.
+  Elsewhere none is required, but any stamp an item carries is judged. A keychain outside
+  `Library/Keychains` has no creator stamp, so for custody it is test-only: today no product opens one,
+  and every `create_at` and `open_at` caller is a row on a temporary directory (read by value,
+  2026-11-26). A keychain path must be absolute, since a relative one is created in the person's own
+  `Library/Keychains` (E m/37831). All of it is read
+  on every read, so a list changed after adoption is refused at the next one. Any other item is refused,
+  naming its maker. A successor takes a key only by a hand-off, and a hand-off cut short (its `.next` held,
   the item not) is finished by `handoff::finish`.
 - **It never prints and never leaves.** The key signs and hands out its public half. Its `Debug` shows
   only the public half, and nothing exports its bytes.

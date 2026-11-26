@@ -359,18 +359,22 @@ fn write_key(
     Ok((kept, how))
 }
 
-/// Whether a held item is this build's (D m/37751): every entry on its access list is the house's, and its note names
-/// this build or its list trusts this build's requirement (a signing change carried across, F m/37706). The house's
-/// entries are exactly two kinds: a requirement the trust table pins to its team, and this build's own designated
-/// requirement, the creator entry a plain `add` writes (so every item made before carry-across reads as ours by its
-/// note). A note naming us excuses no foreign entry (F m/37745): an item's creator is on its list by default and any
-/// process may add one. Read off the item's attributes, never its value. A list that can't be read is not this
-/// build's, except on a macOS that doesn't export the call reading a list's requirements: then the note alone, as
-/// before carry-across, so that update breaks the carry-across only, never an ordinary adopt (D m/37740).
+/// Whether a held item is this build's (D m/37751, m/37792): every entry on its access list is the house's (who reads
+/// it, who may change the list, and the partitions naming the code that made it), and its note names this build or its
+/// list trusts this build's requirement (a signing change carried across, F m/37706). A requirement is the house's when
+/// the trust table pins it to its team or it is this build's own designated requirement (the creator entry a plain
+/// `add` writes). A partition is the house's when it is `teamid:<a team the table trusts>`, or `cdhash:<this binary's
+/// own>` only when this binary has no team (an ad hoc test build): securityd stamps the real creator and it can't be
+/// forged away, so a planted item, even one listing only us under our note with a value its planter chose, carries
+/// its planter's stamp and is refused (F m/37773), as is one made by `security add-generic-password` (`apple-tool:`).
+/// The owner entry may be empty, the person alone with the keychain password, as every item custody writes leaves it.
+/// Read off the item's attributes, never its value, on every read, so a list changed after adoption is refused at the
+/// next one. A list that can't be read is not this build's, except on a macOS that doesn't export the call reading a
+/// list's requirements: then the note alone, as before carry-across, said once at WARN (D m/37740, m/37770).
 fn ours(keychain: &Keychain, item: &Item, made_by: &str) -> bool {
     let noted = keychain.maker(item).as_deref() == Some(made_by);
-    let trusted = match keychain.trusts(item) {
-        Ok(trusted) => trusted,
+    let listing = match keychain.listing(item) {
+        Ok(listing) => listing,
         Err(crate::custody::Trusting::Unsupported { why, .. }) => {
             note_alone(&why);
             return noted;
@@ -379,11 +383,25 @@ fn ours(keychain: &Keychain, item: &Item, made_by: &str) -> bool {
     };
     let me = crate::access::requirement(made_by).ok();
     let running = crate::identity::own_requirement().ok().and_then(|r| crate::access::requirement(&r).ok());
+    let own_cdhash = running
+        .as_deref()
+        .and_then(|r| r.strip_prefix("cdhash H\""))
+        .and_then(|r| r.strip_suffix('"'))
+        .map(|hash| format!("cdhash:{}", hash.to_ascii_lowercase()));
     let table = crate::identity::TrustTable::house();
+    let teams: Vec<String> = table
+        .entries()
+        .iter()
+        .filter_map(|t| match t {
+            crate::identity::Trusted::Anemnez { team } => Some(format!("teamid:{team}")),
+            _ => None,
+        })
+        .collect();
     let house = |r: &str| {
         Some(r) == me.as_deref() || Some(r) == running.as_deref() || crate::access::team_pinned(r, &table).is_ok()
     };
-    ours_by_access(noted, &trusted, me.as_deref(), house)
+    let made_here = |p: &str| teams.iter().any(|t| t == p) || Some(p) == own_cdhash.as_deref();
+    ours_by_access(noted, &listing, keychain.stamps(), me.as_deref(), house, made_here)
 }
 
 /// Said once per process at WARN, the first time [`ours`] reads by the note alone, so a host on that fallback is seen
@@ -395,13 +413,25 @@ fn note_alone(why: &str) {
     });
 }
 
-/// The access list's half of [`ours`], pure: every entry `house`, and the note naming this build (`noted`) or the list
-/// trusting its requirement (`me`, as the framework prints it). One entry outside the house refuses it, whatever the
-/// note says. An empty list trusts no one.
-fn ours_by_access(noted: bool, trusted: &[String], me: Option<&str>, house: impl Fn(&str) -> bool) -> bool {
-    !trusted.is_empty()
-        && trusted.iter().all(|r| house(r))
-        && (noted || me.is_some_and(|me| trusted.iter().any(|r| r == me)))
+/// The access list's half of [`ours`], pure: someone reads it and every reader is `house`, every owner is `house` (none
+/// is the person alone), it carries a partition where its keychain `stamped` its items, and every partition is
+/// `made_here`, and the note names this build (`noted`)
+/// or the list trusts its requirement (`me`, as the framework prints it). One entry outside the house refuses it,
+/// whatever the note says.
+fn ours_by_access(
+    noted: bool,
+    listing: &crate::custody::Listing,
+    stamped: bool,
+    me: Option<&str>,
+    house: impl Fn(&str) -> bool,
+    made_here: impl Fn(&str) -> bool,
+) -> bool {
+    !listing.readers.is_empty()
+        && listing.readers.iter().all(|r| house(r))
+        && listing.owners.iter().all(|r| house(r))
+        && (!stamped || !listing.partitions.is_empty())
+        && listing.partitions.iter().all(|p| made_here(p))
+        && (noted || me.is_some_and(|me| listing.readers.iter().any(|r| r == me)))
 }
 
 /// Nothing is held under the item: whether a hand-off is pending, by its `.next` item's answer. An answer that isn't one
@@ -642,22 +672,40 @@ mod tests {
         assert!(matches!(failed, Err(SignerError::Store(_))), "any other error is the store's: {failed:?}");
     }
 
-    /// The access list's half of `ours`, every case (D m/37713, m/37751): a list of the house's entries alone, this
-    /// build's among them, is this build's; so is one its note names; one foreign entry refuses it, note or not (F
-    /// m/37745); a house list that neither names this build nor is noted as it is not; an empty list is not; an own
-    /// requirement that didn't parse counts only by the note.
+    /// The access list's half of `ours`, every case (D m/37713, m/37751, m/37792): readers, owners and partitions all
+    /// the house's, and this build named by its note or its list; one entry outside the house anywhere refuses it.
     #[test]
     fn a_house_only_access_list_is_this_builds_by_list_or_note_and_one_foreign_entry_refuses_it() {
         let house = |r: &str| r.starts_with("team:") || r == "own";
-        let list = |rs: &[&str]| rs.iter().map(|r| (*r).to_owned()).collect::<Vec<_>>();
-        assert!(ours_by_access(false, &list(&["team:me", "team:before"]), Some("team:me"), house));
-        assert!(ours_by_access(true, &list(&["own"]), Some("team:me"), house), "a plain add's creator entry, noted");
-        assert!(!ours_by_access(false, &list(&["team:me", "cdhash H\"00\""]), Some("team:me"), house), "a planter");
-        assert!(!ours_by_access(true, &list(&["own", "cdhash H\"00\""]), Some("team:me"), house), "noted, planted");
-        assert!(!ours_by_access(true, &list(&["own", "<any application>"]), Some("team:me"), house), "any application");
-        assert!(!ours_by_access(false, &list(&["team:before"]), Some("team:me"), house), "trusted by neither");
-        assert!(!ours_by_access(true, &[], Some("team:me"), house), "an empty list trusts no one");
-        assert!(!ours_by_access(false, &list(&["team:me"]), None, house), "an own requirement that didn't parse");
+        let made_here = |p: &str| p == "teamid:house";
+        let l = |readers: &[&str], owners: &[&str], partitions: &[&str]| crate::custody::Listing {
+            readers: readers.iter().map(|r| (*r).to_owned()).collect(),
+            owners: owners.iter().map(|r| (*r).to_owned()).collect(),
+            partitions: partitions.iter().map(|r| (*r).to_owned()).collect(),
+        };
+        let ok =
+            |noted, listing: &crate::custody::Listing, me| ours_by_access(noted, listing, true, me, house, made_here);
+        let here = ["teamid:house"];
+        assert!(ok(false, &l(&["team:me", "team:before"], &[], &here), Some("team:me")), "carried across");
+        assert!(ok(true, &l(&["own"], &[], &here), Some("team:me")), "a plain add's creator entry, noted");
+        assert!(ok(true, &l(&["own"], &["own"], &here), Some("team:me")), "an owner of the house");
+        assert!(!ok(false, &l(&["team:me", "cdhash H\"00\""], &[], &here), Some("team:me")), "a planter reads");
+        assert!(!ok(true, &l(&["own", "cdhash H\"00\""], &[], &here), Some("team:me")), "noted, planted");
+        assert!(!ok(true, &l(&["own", "<any application>"], &[], &here), Some("team:me")), "any application reads");
+        assert!(!ok(false, &l(&["team:me", "<unreadable>"], &[], &here), Some("team:me")), "a reader it can't read");
+        assert!(!ok(true, &l(&["own"], &["cdhash H\"00\""], &here), Some("team:me")), "a foreign owner");
+        assert!(!ok(true, &l(&["own"], &["<any application>"], &here), Some("team:me")), "anyone may re-list");
+        assert!(!ok(true, &l(&["own"], &[], &["teamid:house", "cdhash:00"]), Some("team:me")), "a planter's stamp");
+        assert!(!ok(true, &l(&["own"], &[], &["apple-tool:"]), Some("team:me")), "made by the security tool");
+        assert!(!ok(true, &l(&["own"], &[], &["<unreadable>"]), Some("team:me")), "a stamp that can't be read");
+        assert!(!ok(true, &l(&["own"], &[], &[]), Some("team:me")), "no stamp where its keychain stamps");
+        let unstamped =
+            |listing: &crate::custody::Listing| ours_by_access(true, listing, false, Some("team:me"), house, made_here);
+        assert!(unstamped(&l(&["own"], &[], &[])), "a keychain file of its own stamps nothing");
+        assert!(!unstamped(&l(&["own"], &[], &["cdhash:00"])), "but a stamp there is still judged");
+        assert!(!ok(false, &l(&["team:before"], &[], &here), Some("team:me")), "trusted by neither");
+        assert!(!ok(true, &l(&[], &[], &here), Some("team:me")), "an empty list trusts no one");
+        assert!(!ok(false, &l(&["team:me"], &[], &here), None), "an own requirement that didn't parse");
     }
 
     /// On a real keychain (D m/37713, F m/37745): an item listing this build's team requirement beside a code outside
@@ -693,6 +741,38 @@ mod tests {
         let plain = item("node-d");
         k.add(&plain, &key, ME).expect("a plain add");
         assert!(ours(&k, &plain, ME), "by its note, its creator entry the running binary's own");
+        // A planter that copies everything ours carries, and adds a house team's partition, still carries its own
+        // stamp beside it (D m/37792): here the planter is this binary, so stamp a foreign team for it to be judged.
+        let forged = item("node-e");
+        k.add_planted(
+            &forged,
+            &key,
+            ME,
+            &crate::custody::Planted { trusted: &[], with_self: true, owners: &[], partitions: &["teamid:ZZZZZZZZZZ"] },
+        )
+        .expect("a foreign team's stamp");
+        assert!(matches!(held(&k, &forged, ME), Err(SignerError::AnotherBuilds { .. })), "a foreign partition");
+        let tool = item("node-f");
+        k.add_planted(
+            &tool,
+            &key,
+            ME,
+            &crate::custody::Planted { trusted: &[], with_self: true, owners: &[], partitions: &["apple-tool:"] },
+        )
+        .expect("as the security tool stamps");
+        assert!(matches!(held(&k, &tool, ME), Err(SignerError::AnotherBuilds { .. })), "apple-tool: is no house");
+        let owned = item("node-g");
+        k.add_planted(
+            &owned,
+            &key,
+            ME,
+            &crate::custody::Planted { trusted: &[], with_self: true, owners: &[foreign.as_str()], partitions: &[] },
+        )
+        .expect("an owner outside the house");
+        assert!(matches!(held(&k, &owned, ME), Err(SignerError::AnotherBuilds { .. })), "a foreign owner re-lists");
+        let listing = k.listing(&plain).expect("reads");
+        assert!(listing.owners.is_empty(), "a plain add's owner is the person alone: {listing:?}");
+        assert!(listing.partitions.is_empty(), "securityd stamps nothing in a keychain file of its own: {listing:?}");
     }
 
     /// The note-alone fallback is said at WARN once per process, never again however often it is taken (D m/37770).

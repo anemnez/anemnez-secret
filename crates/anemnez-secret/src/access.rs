@@ -25,6 +25,8 @@ type SecAclRef = *mut c_void;
 #[link(name = "Security", kind = "framework")]
 unsafe extern "C" {
     static kSecACLAuthorizationDecrypt: CFStringRef;
+    static kSecACLAuthorizationChangeACL: CFStringRef;
+    static kSecACLAuthorizationPartitionID: CFStringRef;
     static kSecAttrAccess: CFStringRef;
     fn SecTrustedApplicationCreateFromPath(path: *const c_char, app: *mut SecTrustedApplicationRef) -> OSStatus;
     fn SecRequirementCreateWithString(text: CFStringRef, flags: u32, requirement: *mut SecRequirementRef) -> OSStatus;
@@ -243,9 +245,26 @@ pub(crate) fn of(item: SecKeychainItemRef) -> Result<CFType, OSStatus> {
     owned(access.cast()).filter(|_| status == 0).ok_or(status)
 }
 
-/// The code requirements an access list trusts to read the value (its decrypt entries), each as the framework spells
-/// it. A trusted application whose requirement can't be read is left out, never guessed.
-pub(crate) fn trusted(access: &CFType) -> Result<Vec<String>, Refused> {
+/// What an item's access list says, read off the item, never its value: who may read the value (its decrypt entries),
+/// who may change the list (its owner, `change_acl` entries), and which code made the item (the partitions securityd
+/// stamps on `partition_id` entries, the creator's own among them; D m/37792). Each requirement is as the framework
+/// prints it. An entry trusting any application is [`ANY_APPLICATION`], and one whose requirement or partitions can't be
+/// read is [`UNREADABLE`]: never left out, so a reader that judges every entry refuses it.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Listing {
+    /// The decrypt entries' requirements: who reads the value without a prompt.
+    pub readers: Vec<String>,
+    /// The owner entries' requirements; empty when only the person, with the keychain password, may change the list.
+    pub owners: Vec<String>,
+    /// The partitions (`teamid:…`, `cdhash:…`, `apple-tool:`, …) the item carries, its creator's stamp among them.
+    pub partitions: Vec<String>,
+}
+
+/// What [`Listing`] names an entry it can't read: never a requirement or a partition, so never the house's.
+pub(crate) const UNREADABLE: &str = "<unreadable>";
+
+/// `access`'s [`Listing`].
+pub(crate) fn listing(access: &CFType) -> Result<Listing, Refused> {
     let private = private().map_err(Refused::Unsupported)?;
     let mut acls: CFArrayRef = std::ptr::null();
     // SAFETY: `access` is alive for the call; the list is returned owned.
@@ -255,9 +274,15 @@ pub(crate) fn trusted(access: &CFType) -> Result<Vec<String>, Refused> {
     }
     // SAFETY: a Copy call's result, owned here.
     let acls: CFArray<CFType> = unsafe { CFArray::wrap_under_create_rule(acls) };
-    // SAFETY: an immutable CFString constant the framework exports.
-    let decrypt = unsafe { CFString::wrap_under_get_rule(kSecACLAuthorizationDecrypt) };
-    let mut found = Vec::new();
+    // SAFETY: immutable CFString constants the framework exports.
+    let (decrypt, change, partition) = unsafe {
+        (
+            CFString::wrap_under_get_rule(kSecACLAuthorizationDecrypt),
+            CFString::wrap_under_get_rule(kSecACLAuthorizationChangeACL),
+            CFString::wrap_under_get_rule(kSecACLAuthorizationPartitionID),
+        )
+    };
+    let mut listing = Listing::default();
     for acl in acls.iter() {
         let acl = acl.as_CFTypeRef().cast_mut();
         // SAFETY: `acl` is alive while `acls` is; the list is returned owned (a Copy call).
@@ -267,43 +292,175 @@ pub(crate) fn trusted(access: &CFType) -> Result<Vec<String>, Refused> {
         }
         // SAFETY: as above.
         let auths: CFArray<CFString> = unsafe { CFArray::wrap_under_create_rule(auths) };
-        if !auths.iter().any(|a| *a == decrypt) {
+        let has = |what: &CFString| auths.iter().any(|a| *a == *what);
+        let (reads, owns, stamps) = (has(&decrypt), has(&change), has(&partition));
+        if !(reads || owns || stamps) {
             continue;
         }
         let (mut apps, mut description, mut prompt): (CFArrayRef, CFStringRef, u16) =
             (std::ptr::null(), std::ptr::null(), 0);
         // SAFETY: out-parameters only; each result is owned here.
         let status = unsafe { SecACLCopyContents(acl, &mut apps, &mut description, &mut prompt) };
-        let _description = owned(description.cast());
+        let description = owned(description.cast());
+        let apps = owned(apps.cast());
         if status != 0 {
             return Err(status.into());
         }
-        // A null application list is "any application": never one custody writes, and never the house's, so it is
-        // named, for a reader that judges every entry to refuse.
-        let Some(apps) = owned(apps.cast()) else {
-            found.push(ANY_APPLICATION.to_owned());
-            continue;
-        };
-        // SAFETY: `apps` is a CFArray, as SecACLCopyContents documents.
-        let apps: CFArray<CFType> = unsafe { CFArray::wrap_under_get_rule(apps.as_CFTypeRef().cast()) };
-        for app in apps.iter() {
-            let mut requirement: SecRequirementRef = std::ptr::null_mut();
-            // SAFETY: `app` is alive while `apps` is; the requirement is returned owned.
-            let status = unsafe { (private.copy_requirement)(app.as_CFTypeRef().cast_mut(), &mut requirement) };
-            let Some(requirement) = owned(requirement).filter(|_| status == 0) else { continue };
-            if let Ok(text) = printed(requirement.as_CFTypeRef().cast_mut()) {
-                found.push(text);
+        if stamps {
+            let text = description.and_then(|d| d.downcast::<CFString>()).map(|d| d.to_string());
+            match text.as_deref().and_then(partitions_of) {
+                Some(found) => listing.partitions.extend(found),
+                None => listing.partitions.push(UNREADABLE.to_owned()),
+            }
+        }
+        if reads || owns {
+            let requirements = applications(private, apps.as_ref());
+            if reads {
+                listing.readers.extend(requirements.iter().cloned());
+            }
+            if owns {
+                listing.owners.extend(requirements);
             }
         }
     }
-    found.sort();
-    found.dedup();
-    Ok(found)
+    for list in [&mut listing.readers, &mut listing.owners, &mut listing.partitions] {
+        list.sort();
+        list.dedup();
+    }
+    Ok(listing)
+}
+
+/// The requirements of an entry's applications: [`ANY_APPLICATION`] for a null list, [`UNREADABLE`] for one whose
+/// requirement can't be read, and nothing for an empty list (no application: the person alone).
+fn applications(private: &Private, apps: Option<&CFType>) -> Vec<String> {
+    let Some(apps) = apps else { return vec![ANY_APPLICATION.to_owned()] };
+    // SAFETY: `apps` is a CFArray, as SecACLCopyContents documents.
+    let apps: CFArray<CFType> = unsafe { CFArray::wrap_under_get_rule(apps.as_CFTypeRef().cast()) };
+    let mut found = Vec::new();
+    for app in apps.iter() {
+        let mut requirement: SecRequirementRef = std::ptr::null_mut();
+        // SAFETY: `app` is alive while `apps` is; the requirement is returned owned.
+        let status = unsafe { (private.copy_requirement)(app.as_CFTypeRef().cast_mut(), &mut requirement) };
+        let text = owned(requirement).filter(|_| status == 0).and_then(|r| printed(r.as_CFTypeRef().cast_mut()).ok());
+        found.push(text.unwrap_or_else(|| UNREADABLE.to_owned()));
+    }
+    found
+}
+
+/// The partitions a `partition_id` entry's description names: hex of an XML property list whose `Partitions` key is an
+/// array of strings, as securityd writes it. Anything else is None, never a guess.
+pub(crate) fn partitions_of(description: &str) -> Option<Vec<String>> {
+    if !description.len().is_multiple_of(2) || !description.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let bytes = (0..description.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&description[i..i + 2], 16).ok())
+        .collect::<Option<Vec<u8>>>()?;
+    let (list, _) =
+        core_foundation::propertylist::create_with_data(core_foundation::data::CFData::from_buffer(&bytes), 0).ok()?;
+    // SAFETY: a Create call's result, owned here.
+    let list = unsafe { CFType::wrap_under_create_rule(list) };
+    let dictionary = list.downcast::<core_foundation::dictionary::CFDictionary>()?;
+    // SAFETY: the dictionary's own value, borrowed while it lives.
+    let dictionary: core_foundation::dictionary::CFDictionary<CFString, CFType> =
+        unsafe { core_foundation::dictionary::CFDictionary::wrap_under_get_rule(dictionary.as_concrete_TypeRef()) };
+    let partitions = dictionary.find(CFString::new("Partitions"))?.downcast::<CFArray>()?;
+    // SAFETY: as above.
+    let partitions: CFArray<CFType> = unsafe { CFArray::wrap_under_get_rule(partitions.as_concrete_TypeRef()) };
+    partitions.iter().map(|p| p.downcast::<CFString>().map(|p| p.to_string())).collect()
+}
+
+/// For rows only: add to `access` what a planter may add before its item exists, an owner entry trusting `owners` and
+/// a `partition_id` entry naming `partitions`. securityd still stamps the real creator beside them.
+#[cfg(test)]
+pub(crate) fn plant(access: &CFType, owners: &[&str], partitions: &[&str]) -> Result<(), Refused> {
+    unsafe extern "C" {
+        fn SecACLCreateWithSimpleContents(
+            access: SecAccessRef,
+            apps: CFArrayRef,
+            description: CFStringRef,
+            prompt: u16,
+            acl: *mut SecAclRef,
+        ) -> OSStatus;
+        fn SecACLUpdateAuthorizations(acl: SecAclRef, authorizations: CFArrayRef) -> OSStatus;
+    }
+    let private = private().map_err(Refused::Unsupported)?;
+    let entry = |apps: Option<&CFArray<CFType>>, description: &str, what: CFStringRef| -> Result<(), Refused> {
+        let description = CFString::new(description);
+        let mut acl: SecAclRef = std::ptr::null_mut();
+        // SAFETY: `access` and the arguments live for the call; the ACL belongs to `access`.
+        let status = unsafe {
+            SecACLCreateWithSimpleContents(
+                access.as_CFTypeRef().cast_mut().cast(),
+                apps.map_or(std::ptr::null(), |a| a.as_concrete_TypeRef()),
+                description.as_concrete_TypeRef(),
+                0,
+                &mut acl,
+            )
+        };
+        if status != 0 {
+            return Err(status.into());
+        }
+        // SAFETY: an immutable constant the framework exports.
+        let what = unsafe { CFString::wrap_under_get_rule(what) };
+        let what = CFArray::from_CFTypes(&[what]);
+        // SAFETY: `acl` is `access`'s, alive; the list lives for the call.
+        let status = unsafe { SecACLUpdateAuthorizations(acl, what.as_concrete_TypeRef()) };
+        if status == 0 { Ok(()) } else { Err(status.into()) }
+    };
+    if !owners.is_empty() {
+        let mut apps = Vec::new();
+        for text in owners {
+            let cf = CFString::new(text);
+            let mut parsed: SecRequirementRef = std::ptr::null_mut();
+            // SAFETY: as in `requirement`.
+            let status = unsafe { SecRequirementCreateWithString(cf.as_concrete_TypeRef(), 0, &mut parsed) };
+            let parsed = owned(parsed).filter(|_| status == 0).ok_or(Refused::Status(status))?;
+            let name = CString::new(*text).map_err(|_| Refused::Status(-50))?;
+            let mut app: SecTrustedApplicationRef = std::ptr::null_mut();
+            // SAFETY: as in `trusting`.
+            let status =
+                unsafe { (private.create_from_requirement)(name.as_ptr(), parsed.as_CFTypeRef().cast_mut(), &mut app) };
+            apps.push(owned(app).filter(|_| status == 0).ok_or(Refused::Status(status))?);
+        }
+        // SAFETY: an immutable constant the framework exports.
+        entry(Some(&CFArray::from_CFTypes(&apps)), "planted owner", unsafe { kSecACLAuthorizationChangeACL })?;
+    }
+    if !partitions.is_empty() {
+        let strings = partitions.iter().map(|p| format!("<string>{p}</string>")).collect::<String>();
+        let plist = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>Partitions</key><array>{strings}</array></dict></plist>"#
+        );
+        let hex = plist.bytes().map(|b| format!("{b:02x}")).collect::<String>();
+        // SAFETY: an immutable constant the framework exports.
+        entry(None, &hex, unsafe { kSecACLAuthorizationPartitionID })?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Refused, private, resolve, trusting};
+    use super::{Refused, partitions_of, private, resolve, trusting};
+
+    /// A partition entry's description reads as securityd writes it, hex of a property list naming `Partitions`, and
+    /// anything else is None, never a guess (D m/37792).
+    #[test]
+    fn a_partition_entry_reads_as_securityd_writes_it_and_nothing_else() {
+        let hex = |s: &str| s.bytes().map(|b| format!("{b:02x}")).collect::<String>();
+        let team = format!("teamid:{}", crate::identity::ANEMNEZ_TEAM);
+        let plist = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>Partitions</key><array><string>{team}</string><string>cdhash:00ff</string></array></dict></plist>"#
+        );
+        assert_eq!(partitions_of(&hex(&plist)), Some(vec![team.clone(), "cdhash:00ff".to_owned()]));
+        assert_eq!(partitions_of("not hex"), None);
+        assert_eq!(partitions_of(&hex("<plist><dict/></plist>")), None, "no Partitions key");
+        assert_eq!(
+            partitions_of(&hex(&plist.replace("<string>cdhash:00ff</string>", "<integer>1</integer>"))),
+            None,
+            "a non-string"
+        );
+    }
 
     /// A name this macOS doesn't export answers a named refusal, never a panic or a null call (E m/37742); the two
     /// private calls the carry-across needs resolve here.
