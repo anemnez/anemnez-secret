@@ -13,7 +13,7 @@ use std::fmt;
 use ed25519_dalek::Signer as _;
 
 use crate::Secret;
-use crate::custody::{CustodyError, Item, Keychain};
+use crate::custody::{Confirmed, CustodyError, Item, Keychain};
 use crate::handoff;
 
 /// The default account shape: a signer's name and the node it is held for, so two hosts, or two
@@ -55,6 +55,10 @@ pub enum Adopted {
     /// A key this product held before custody (a file) was written into its item and read back equal: never a new
     /// key (D m/30267).
     Imported,
+    /// `hand-off-pending`: a hand-off's `.next` is held, alone or beside the item, and is left as it is (D m/38588).
+    /// The key was read from whichever of the two this build reads; only [`held_confirmed`], on the placed build's
+    /// fresh answer, finishes the move.
+    HandOffPending,
 }
 
 /// Why no key was adopted. It never names the key's value.
@@ -78,6 +82,9 @@ pub enum SignerError {
     /// have read or written never becomes this build's identity (E m/30362). The path and its mode or owner, never
     /// its bytes.
     NotPrivate { file: std::path::PathBuf, why: String },
+    /// A hand-off's finish wrote the item, but the placed build, run fresh, didn't read it, so `.next` is kept beside
+    /// it (D m/38565): why, never a value. Run the finish again once that build reads it.
+    HandOffKept { item: Item, why: String },
 }
 
 impl fmt::Display for SignerError {
@@ -100,6 +107,11 @@ impl fmt::Display for SignerError {
             Self::NotPrivate { file, why } => {
                 write!(f, "key-file-not-private: {} {why}; make it 0600 and this user's, then adopt it", file.display())
             }
+            Self::HandOffKept { item, why } => write!(
+                f,
+                "hand-off-kept: {item} is written and its .next kept beside it, since the placed build didn't read it: \
+                 {why}. Nothing is lost; finish again once that build reads it"
+            ),
         }
     }
 }
@@ -299,7 +311,63 @@ fn adopt_or(
 /// # Errors
 /// [`adopt`]'s refusals: Unavailable, another build's, not a key, the store's own.
 pub fn held(keychain: &Keychain, item: &Item, made_by: &str) -> Result<Option<(SigningKey, Adopted)>, SignerError> {
+    held_with(keychain, item, made_by, None)
+}
+
+/// A fresh process of the placed build, asked for the public half of the key it reads under an item (D m/38565): the
+/// reader a carry's finish waits on before `.next` goes. Its caller spawns that build (Artichoke's carry spawns its
+/// placed executable on a hidden verb that prints only the public half).
+pub trait FreshReader {
+    /// The 32-byte public half of the key the fresh process read under `item`, or why it read none
+    /// ([`Confirmed::Cannot`]) or didn't answer within its bound ([`Confirmed::Unclear`]).
+    ///
+    /// # Errors
+    /// Why no public half was read.
+    fn public_of(&self, item: &Item) -> Result<[u8; 32], Confirmed>;
+}
+
+/// A [`FreshReader`] as custody's [`crate::custody::Confirm`]: it reads the item when the public half it read is the
+/// written key's.
+struct ByPublicHalf<'a>(&'a dyn FreshReader);
+
+impl crate::custody::Confirm for ByPublicHalf<'_> {
+    fn confirms(&self, item: &Item, value: &Secret) -> Confirmed {
+        let Ok(written) = parse(item, value) else {
+            return Confirmed::Cannot(format!("{item} doesn't hold a 32-byte key"));
+        };
+        match self.0.public_of(item) {
+            Ok(public) if public == written.verifying_key().to_bytes() => Confirmed::Reads,
+            Ok(_) => Confirmed::Cannot(format!("the placed build reads another key under {item}")),
+            Err(Confirmed::Reads) => Confirmed::Cannot("the reader said it read, and gave no public half".into()),
+            Err(said) => said,
+        }
+    }
+}
+
+/// [`held`], finishing a pending hand-off only once `fresh`, the placed build run fresh, reads the moved item's key
+/// (D m/38565): the form a carry takes. Short of that, both are kept and it is [`SignerError::HandOffKept`].
+///
+/// # Errors
+/// [`held`]'s, and [`SignerError::HandOffKept`].
+pub fn held_confirmed(
+    keychain: &Keychain,
+    item: &Item,
+    made_by: &str,
+    fresh: &dyn FreshReader,
+) -> Result<Option<(SigningKey, Adopted)>, SignerError> {
+    held_with(keychain, item, made_by, Some(&ByPublicHalf(fresh)))
+}
+
+fn held_with(
+    keychain: &Keychain,
+    item: &Item,
+    made_by: &str,
+    confirm: Option<&dyn crate::custody::Confirm>,
+) -> Result<Option<(SigningKey, Adopted)>, SignerError> {
     let read = match keychain.held(item) {
+        // A move kept short of its other reader (or cut after its write) leaves both: a pending hand-off, never used
+        // past, so a kept `.next` is never left behind unconfirmed.
+        Ok(true) if matches!(keychain.held(&item.next()), Ok(true)) => Read::NotHeld { next: true },
         Ok(true) => Read::Held { ours: ours(keychain, item, made_by) },
         Ok(false) => not_held(keychain.held(&item.next()))?,
         Err(CustodyError::Unavailable { .. }) => Read::Unavailable,
@@ -315,11 +383,23 @@ pub fn held(keychain: &Keychain, item: &Item, made_by: &str) -> Result<Option<(S
             maker: keychain.maker(item),
             this_build: made_by.to_owned(),
         }),
-        Step::FinishHandOff => {
-            handoff::finish(keychain, item, made_by).map_err(SignerError::Store)?;
-            let secret = keychain.get(item).map_err(|e| unavailable(keychain, item, made_by, e))?;
-            Ok(Some((held_by(keychain, item, made_by, &secret)?, Adopted::Finished)))
-        }
+        Step::FinishHandOff => match confirm {
+            // No other reader: never finished on this process's own read-back (D m/38588, MB16's path). The key is
+            // read from whichever item this build reads, and the pair is left as it is.
+            None => {
+                let from = if matches!(keychain.held(item), Ok(true)) { item.clone() } else { item.next() };
+                let secret = keychain.get(&from).map_err(|e| unavailable(keychain, &from, made_by, e))?;
+                Ok(Some((held_by(keychain, &from, made_by, &secret)?, Adopted::HandOffPending)))
+            }
+            Some(confirm) => {
+                match handoff::finish_confirmed(keychain, item, made_by, confirm).map_err(SignerError::Store)? {
+                    handoff::Finished::Done => {}
+                    handoff::Finished::Kept(why) => return Err(SignerError::HandOffKept { item: item.clone(), why }),
+                }
+                let secret = keychain.get(item).map_err(|e| unavailable(keychain, item, made_by, e))?;
+                Ok(Some((held_by(keychain, item, made_by, &secret)?, Adopted::Finished)))
+            }
+        },
         Step::Make => Ok(None),
         Step::RefuseUnavailable => Err(SignerError::Unavailable {
             item: item.clone(),
@@ -494,8 +574,8 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Adopted, Read, SignerError, Step, account, adopt, adopt_existing, adopt_file, held, not_held, note_alone, ours,
-        ours_by_access, retire_adopted, step,
+        Adopted, Confirmed, Read, SignerError, Step, account, adopt, adopt_existing, adopt_file, held, not_held,
+        note_alone, ours, ours_by_access, retire_adopted, step,
     };
     use crate::Secret;
     use crate::custody::CustodyError;
@@ -624,15 +704,73 @@ mod tests {
         let it = item("node-a");
         // What a hand-off leaves when it stops before its rename: the successor's own .next item.
         k.add(&it.next(), &Secret::new(b"22".repeat(32)), ME).expect("the handed-off item");
-        let (key, how) = adopt(&k, &it, ME).expect("finished");
-        assert_eq!(how, Adopted::Finished);
+        let (pending, how) = adopt(&k, &it, ME).expect("read");
+        assert_eq!(how, Adopted::HandOffPending, "a start never finishes it on its own read-back");
+        let public = pending.verifying_key().to_bytes();
+        let (key, how) = super::held_confirmed(&k, &it, ME, &Fresh(Ok(public))).expect("finished").expect("held");
+        assert_eq!(how, Adopted::Finished, "the placed build read it fresh");
         assert!(k.held(&it).unwrap_or(false) && !k.held(&it.next()).unwrap_or(true), ".next moved into place");
         let (again, how) = adopt(&k, &it, ME).expect("held");
         assert_eq!((how, again.verifying_key()), (Adopted::Held, key.verifying_key()));
     }
 
+    /// The placed build, run fresh, as a stand-in: the public half it answers, or why not.
+    struct Fresh(Result<[u8; 32], Confirmed>);
+    impl super::FreshReader for Fresh {
+        fn public_of(&self, _: &Item) -> Result<[u8; 32], Confirmed> {
+            self.0.clone()
+        }
+    }
+
+    /// A carry's finish keeps `.next` until the placed build, run fresh, reads the moved key (D m/38565): a fresh
+    /// reader that can't read it, that reads another key or that doesn't answer leaves both held and is
+    /// `hand-off-kept`, by name; one that reads the same public half moves it, and the key is this build's.
+    #[test]
+    fn a_carry_finishes_only_once_the_placed_build_reads_the_key_fresh() {
+        let (_dir, k, _) = keychain();
+        let it = item("node-a");
+        k.add(&it.next(), &Secret::new(b"22".repeat(32)), ME).expect("the handed-off item");
+        let public = ed25519_dalek::SigningKey::from_bytes(&[0x22; 32]).verifying_key().to_bytes();
+        for refused in [
+            Fresh(Err(Confirmed::Cannot("OSStatus -25293".into()))),
+            Fresh(Err(Confirmed::Unclear("no answer within 10 s".into()))),
+            Fresh(Ok([0x99; 32])),
+        ] {
+            let got = super::held_confirmed(&k, &it, ME, &refused);
+            assert!(matches!(&got, Err(SignerError::HandOffKept { .. })), "{:?}", got.map(|_| ()));
+            assert!(got.map(|_| ()).unwrap_err().to_string().starts_with("hand-off-kept"), "said by name");
+            assert!(k.held(&it).unwrap_or(false) && k.held(&it.next()).unwrap_or(false), "both kept");
+        }
+        let (key, how) = super::held_confirmed(&k, &it, ME, &Fresh(Ok(public))).expect("read").expect("held");
+        assert_eq!((how, key.verifying_key().to_bytes()), (Adopted::Finished, public));
+        assert!(!k.held(&it.next()).unwrap_or(true), "read fresh: .next goes");
+    }
+
+    /// A start that meets a pending `.next` leaves both (D m/38588): `held` and `adopt` read the key from whichever item
+    /// this build reads and say `hand-off-pending`, never finishing on their own read-back (MB16's path), and never
+    /// make a key in its place.
+    #[test]
+    fn a_start_that_meets_a_pending_next_leaves_both() {
+        let (_dir, k, _) = keychain();
+        let public = ed25519_dalek::SigningKey::from_bytes(&[0x22; 32]).verifying_key();
+        let alone = item("node-a");
+        k.add(&alone.next(), &Secret::new(b"22".repeat(32)), ME).expect("the handed-off item");
+        for (n, read) in [held(&k, &alone, ME).map(|h| h.expect("read")), adopt(&k, &alone, ME)].into_iter().enumerate()
+        {
+            let (key, how) = read.expect("read");
+            assert_eq!((how, key.verifying_key()), (Adopted::HandOffPending, public), "{n}");
+            assert!(k.held(&alone.next()).unwrap_or(false) && !k.held(&alone).unwrap_or(true), "{n}: left as it was");
+        }
+        let both = item("node-b");
+        k.add(&both.next(), &Secret::new(b"22".repeat(32)), ME).expect("the handed-off item");
+        k.add(&both, &Secret::new(b"22".repeat(32)), ME).expect("the moved item, its original kept");
+        let (key, how) = held(&k, &both, ME).expect("read").expect("held");
+        assert_eq!((how, key.verifying_key()), (Adopted::HandOffPending, public));
+        assert!(k.held(&both.next()).unwrap_or(false) && k.held(&both).unwrap_or(false), "both left");
+    }
+
     /// A read never makes a key: nothing held is `None` and leaves nothing behind, a held key is read as held, a hand-off
-    /// cut short is finished as `adopt` finishes it, and a locked keychain or another build's item is refused as
+    /// cut short is read and left pending as `adopt` leaves it, and a locked keychain or another build's item is refused as
     /// `adopt` refuses it. Red when `held` mints where `adopt` would.
     #[test]
     fn a_read_never_makes_a_key_and_otherwise_answers_as_adopt_does() {
@@ -645,9 +783,9 @@ mod tests {
         assert_eq!((read.verifying_key(), how), (made.verifying_key(), Adopted::Held));
         let handed = item("node-b");
         k.add(&handed.next(), &Secret::new(b"44".repeat(32)), ME).expect("the handed-off item");
-        let (_, how) = held(&k, &handed, ME).expect("finished").expect("held");
-        assert_eq!(how, Adopted::Finished);
-        assert!(k.held(&handed).unwrap_or(false) && !k.held(&handed.next()).unwrap_or(true), ".next moved into place");
+        let (_, how) = held(&k, &handed, ME).expect("read").expect("held");
+        assert_eq!(how, Adopted::HandOffPending, "read as adopt reads it, the pair left");
+        assert!(k.held(&handed.next()).unwrap_or(false) && !k.held(&handed).unwrap_or(true), "left as it was");
         let theirs = item("node-c");
         k.add(&theirs, &Secret::new(b"55".repeat(32)), OTHER).expect("another build's item");
         assert!(matches!(held(&k, &theirs, ME), Err(SignerError::AnotherBuilds { .. })));

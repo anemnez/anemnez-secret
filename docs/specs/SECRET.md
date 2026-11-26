@@ -75,6 +75,19 @@ original removed, and only then does `.next` take the item's name. A run cut sho
 when run again. The proof is an HMAC-SHA-256 of the value under a fresh nonce the old build chose,
 so it gives a guesser nothing to test a value against, even a short secret.
 
+**`.next` goes only once a reader other than its writer reads the item** (D m/38565, m/38588). The
+writing process can read what it just wrote, so its read-back proves nothing about the build that must
+read the item next: that is how MB16's carry was left with one copy. `rename_confirmed` takes a
+`Confirm`, the caller's other reader, and removes `from` only on its `Reads`; a refusal or no answer
+keeps both, `Moved::Kept`, named. A carry finishes by `signer::held_confirmed` with a `FreshReader`, the
+placed build spawned fresh and asked for the public half it reads, compared with the written key's;
+short of a match it is `hand-off-kept`, both held, and runs again. Nothing else finishes a hand-off:
+`held` and `adopt`, meeting a pending `.next` (alone or beside the item), read the key from whichever
+item this build reads, leave the pair as it is and say `hand-off-pending`; `handoff::finish` and
+retrust's `serve` write the item and keep `.next`, `hand-off-kept`, so the item they read from is never
+removed. Plain `rename` keeps the writer's own read-back, named `WritersOwnRead`, for a move whose next
+reader is the same build (fabricd's seal).
+
 <!-- claim: a-key-goes-only-to-a-checked-successor -->
 **A key goes only to a successor its holder has checked** (retrust; F's retrust, D's conditions). The
 holder starts the successor binary as a child and listens on a socket in a fresh directory only it

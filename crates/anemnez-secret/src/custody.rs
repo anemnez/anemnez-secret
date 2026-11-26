@@ -116,6 +116,48 @@ impl std::fmt::Display for Item {
     }
 }
 
+/// Whether a reader other than the writer read an item (D m/38565): a fresh process of the build that must read it,
+/// asked by its caller, since only the caller can spawn that build.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Confirmed {
+    /// It read the item, and the value it read is the one written.
+    Reads,
+    /// It answered, and could not read the item, or read another value: why, never the value.
+    Cannot(String),
+    /// It didn't answer within its bound: unclear, kept as a refusal (rule 5).
+    Unclear(String),
+}
+
+/// A reader other than the writer, asked whether it reads `item` holding `value` ([`Keychain::rename`]).
+pub trait Confirm {
+    /// Ask the other reader; compare what it read with `value` (never print either).
+    fn confirms(&self, item: &Item, value: &Secret) -> Confirmed;
+}
+
+/// The writer's own read-back, named for what it is: what [`Keychain::rename`] trusts, for a move whose next reader is
+/// this same build (fabricd's seal retiring its own key). It proves only that this process reads `item`, so no hand-off
+/// finishes on it (D m/38588): a carry passes a fresh process of its placed build instead.
+pub struct WritersOwnRead<'a>(pub &'a Keychain);
+
+impl Confirm for WritersOwnRead<'_> {
+    fn confirms(&self, item: &Item, value: &Secret) -> Confirmed {
+        match self.0.get(item) {
+            Ok(read) if read.expose(|r| value.expose(|v| r == v)) => Confirmed::Reads,
+            Ok(_) => Confirmed::Cannot(format!("{item} reads another value")),
+            Err(e) => Confirmed::Cannot(e.to_string()),
+        }
+    }
+}
+
+/// What a [`Keychain::rename`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Moved {
+    /// `to` holds the value and its other reader read it; `from` is gone.
+    Moved,
+    /// `to` holds the value, but its other reader didn't read it, so `from` is kept beside it: why.
+    Kept(String),
+}
+
 /// Why custody did not do what it was asked. Never a value.
 #[derive(Debug, PartialEq, Eq)]
 pub enum CustodyError {
@@ -563,11 +605,36 @@ impl Keychain {
         attributes.get("icmt")?.strip_prefix(MADE_BY).map(str::to_owned)
     }
 
-    /// Move this build's own `from` to `to`: written under `to` (never over an item there), read back,
-    /// and only then is `from` removed, so one of the two always holds the value. `to` gets `from`'s access list,
-    /// so a requirement [`Self::add_trusting`] gave `from` is never lost at the move (a hand-off's `.next` moved into
-    /// place keeps every reader it was written for).
+    /// Move this build's own `from` to `to`, `from` removed once this writer's own read-back reads `to`
+    /// ([`WritersOwnRead`]): [`Self::rename_confirmed`] with no other reader, for a move whose next reader is this same
+    /// build (fabricd's seal retiring its own key). A carry, whose next reader is another build, takes
+    /// [`Self::rename_confirmed`].
+    ///
+    /// # Errors
+    /// As [`Self::rename_confirmed`]; a move its own read-back didn't confirm is the store's, both kept.
     pub fn rename(&self, from: &Item, to: &Item, made_by: &str) -> Result<(), CustodyError> {
+        match self.rename_confirmed(from, to, made_by, &WritersOwnRead(self))? {
+            Moved::Moved => Ok(()),
+            Moved::Kept(_) => Err(CustodyError::Store { item: to.clone(), status: 0 }),
+        }
+    }
+
+    /// Move this build's own `from` to `to`: written under `to` (never over an item there), read back, and then
+    /// `from` is removed only once `confirm` says a reader other than this writer read `to` (D m/38565): the writing
+    /// process can read what it just wrote, so its own read-back proves nothing about the build that must read it
+    /// next. Anything short of [`Confirmed::Reads`] keeps both, [`Moved::Kept`] naming why, so one of the two always
+    /// holds the value where its reader can reach it. `to` gets `from`'s access list without its stamps
+    /// ([`crate::access`]), so every reader `from` was written for survives the move.
+    ///
+    /// # Errors
+    /// The store's, on reading `from` or writing `to`; a `to` that reads back another value is the store's too.
+    pub fn rename_confirmed(
+        &self,
+        from: &Item,
+        to: &Item,
+        made_by: &str,
+        confirm: &dyn Confirm,
+    ) -> Result<Moved, CustodyError> {
         let value = self.get(from)?;
         let access =
             crate::access::of_for_writing(core_foundation::base::TCFType::as_concrete_TypeRef(&self.reference(from)?))
@@ -577,7 +644,10 @@ impl Keychain {
         if back.expose(|b| value.expose(|v| b != v)) {
             return Err(CustodyError::Store { item: to.clone(), status: 0 });
         }
-        self.remove(from)
+        match confirm.confirms(to, &value) {
+            Confirmed::Reads => self.remove(from).map(|()| Moved::Moved),
+            Confirmed::Cannot(why) | Confirmed::Unclear(why) => Ok(Moved::Kept(why)),
+        }
     }
 
     /// The accounts held under `service`, found by their attributes alone: no value is read into memory
@@ -854,6 +924,40 @@ mod tests {
         assert_eq!(k.get(&item).expect("reads").expose(|v| v.to_vec()), VALUE.as_bytes());
     }
 
+    /// A stand-in for the fresh process a carry spawns: it answers what it's told.
+    struct Says(super::Confirmed);
+    impl super::Confirm for Says {
+        fn confirms(&self, _: &Item, _: &Secret) -> super::Confirmed {
+            self.0.clone()
+        }
+    }
+
+    /// A `to` the writer reads and a fresh reader can't keeps `from` (D m/38565): the move removes `from` only on
+    /// the other reader's word, never on the writer's own read-back; refused or unanswered, both are kept, by name.
+    #[test]
+    fn a_rename_keeps_the_original_until_another_reader_reads_the_moved_item() {
+        let (_dir, k) = keychain();
+        for (n, said) in [
+            super::Confirmed::Cannot("the placed build can't read it".into()),
+            super::Confirmed::Unclear("no answer within its bound".into()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let item = Item::new("ai.anemnez.example.role", format!("kept-{n}@node"));
+            k.add(&item.next(), &Secret::new(VALUE.as_bytes().to_vec()), MAKER).expect("made");
+            let moved = k.rename_confirmed(&item.next(), &item, MAKER, &Says(said.clone())).expect("written");
+            assert!(matches!(&moved, super::Moved::Kept(why) if !why.is_empty()), "{said:?}: {moved:?}");
+            assert!(k.held(&item.next()).expect("reads"), "{said:?}: the original is kept");
+            assert!(k.held(&item).expect("reads"), "{said:?}: beside the moved item");
+        }
+        let item = Item::new("ai.anemnez.example.role", "moved@node");
+        k.add(&item.next(), &Secret::new(VALUE.as_bytes().to_vec()), MAKER).expect("made");
+        let moved = k.rename_confirmed(&item.next(), &item, MAKER, &Says(super::Confirmed::Reads)).expect("written");
+        assert_eq!(moved, super::Moved::Moved);
+        assert!(!k.held(&item.next()).expect("reads"), "read by the other reader: the original goes");
+    }
+
     /// A rename never copies the partitions stamped on the item it moves (F m/38557): securityd stamps the item's
     /// creator itself, and an add that sets a partition entry asks for the keychain's password where securityd stamps,
     /// so a copied stamp failed MB16's move with -25293 and dialogs off. The readers survive the move; the planted
@@ -883,6 +987,8 @@ mod tests {
     /// stamps; never the login keychain): the move F's MB16 carry failed (F m/38557). `.next` trusts this binary by
     /// requirement alone, as a team-only list trusts the placed build, and is stamped with this binary's partition.
     /// The rename's add was refused -25293 while the stamp was copied; now the moved item reads, stamped afresh.
+    /// It stays `#[ignore]`, by hand only, and never reaches a gate (rule 10, E m/38563): it makes a keychain in the
+    /// person's ~/Library/Keychains, so never un-ignore it for coverage.
     #[test]
     #[ignore = "by hand: a scratch keychain under ~/Library/Keychains, where securityd stamps"]
     fn a_rename_in_a_stamped_keychain_is_stamped_afresh_never_refused() {

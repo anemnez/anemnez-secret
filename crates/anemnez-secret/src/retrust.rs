@@ -168,7 +168,9 @@ pub fn to_on(
 
 /// The successor's side, run by the new build when started with [`SOCKET_ENV`] set: receive the
 /// value under `item` in `keychain`, prove it, and finish when told to. `made_by` is this build's
-/// designated requirement, written on the items it makes.
+/// designated requirement, written on the items it makes. Its finish writes the item and keeps `.next`
+/// (`hand-off-kept`, [`handoff::finish`]): this process wrote `.next`, so it never removes what it read from
+/// (D m/38588); the placed build's `signer::held_confirmed` finishes it.
 pub fn serve(socket: &Path, keychain: &Keychain, item: &Item, made_by: &str) -> Result<(), String> {
     let mut stream = UnixStream::connect(socket).map_err(|e| e.to_string())?;
     stream.set_read_timeout(Some(STEP)).map_err(|e| e.to_string())?;
@@ -325,10 +327,24 @@ mod tests {
         assert!(k.held(&item).unwrap() && !k.held(&item.next()).unwrap(), "an unsigned child gets nothing");
 
         let successor = |_: &std::os::unix::net::UnixStream| Ok(id("TEAM", "ai.anemnez.exampled"));
-        to_on(&anemnez_clock::Clock::system(), &k, &item, &me, &args, "ai.anemnez.exampled", &own, &owner, &successor)
-            .expect("handed over");
+        // Handed over: the child writes the item, and keeps its .next beside it, since the child wrote .next and its
+        // own read-back proves nothing about the build that reads the item next (D m/38588). A later
+        // signer::held_confirmed, the placed build run fresh, finishes it.
+        let kept = to_on(
+            &anemnez_clock::Clock::system(),
+            &k,
+            &item,
+            &me,
+            &args,
+            "ai.anemnez.exampled",
+            &own,
+            &owner,
+            &successor,
+        )
+        .unwrap_err();
+        assert!(kept.contains("hand-off-kept"), "{kept}");
         assert_eq!(k.get(&item).unwrap().expose(|v| v.to_vec()), VALUE.as_bytes());
-        assert!(!k.held(&item.next()).unwrap());
+        assert!(k.held(&item.next()).unwrap(), ".next kept beside it");
         assert_eq!(k.maker(&item).as_deref(), Some("the child"), "the child's item now");
     }
 }

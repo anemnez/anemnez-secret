@@ -14,7 +14,7 @@
 use sha2::{Digest, Sha256};
 
 use crate::Secret;
-use crate::custody::{CustodyError, Item, Keychain};
+use crate::custody::{Confirm, Confirmed, CustodyError, Item, Keychain, Moved};
 
 /// A successor's proof that it holds a value: HMAC-SHA-256(nonce, value).
 pub type Witness = [u8; 32];
@@ -106,14 +106,66 @@ pub fn receive(
     Ok(witness(&kept, nonce))
 }
 
-/// The successor's side, finishing: once the original is gone, move `.next` to the item.
+/// The successor's side, finishing with no other reader: once the original is gone, write the item from `.next` and
+/// keep `.next` beside it, an error saying `hand-off-kept` (D m/38588). This process wrote `.next`, so its own read-back
+/// proves nothing about the build that reads the item next (MB16's path); only [`finish_confirmed`], on another
+/// reader's word, removes `.next`. `retrust::serve` finishes so: the item it read from is never removed.
+///
+/// # Errors
+/// As [`finish_confirmed`], and a move kept beside its `.next` as `hand-off-kept`.
 pub fn finish(keychain: &Keychain, item: &Item, made_by: &str) -> Result<(), String> {
+    match finish_confirmed(keychain, item, made_by, &NoOtherReader)? {
+        Finished::Done => Ok(()),
+        Finished::Kept(why) => Err(why),
+    }
+}
+
+/// No reader but this writer: never confirms, so `.next` is kept.
+struct NoOtherReader;
+
+impl Confirm for NoOtherReader {
+    fn confirms(&self, _: &Item, _: &Secret) -> Confirmed {
+        Confirmed::Unclear(
+            "no reader but its writer; finish it by signer::held_confirmed, the placed build run fresh".into(),
+        )
+    }
+}
+
+/// What [`finish_confirmed`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Finished {
+    /// The item holds the value, read by `confirm`'s reader, and `.next` is gone (or there was nothing to move).
+    Done,
+    /// The item holds the value, but `confirm`'s reader didn't read it, so `.next` is kept beside it: why, by name.
+    Kept(String),
+}
+
+/// [`finish`], with `.next` removed only once `confirm`, a reader other than this writer (the placed build, run
+/// fresh), reads the item (D m/38565). Short of that, both are kept, [`Finished::Kept`].
+///
+/// # Errors
+/// Both held with different values, neither held, an original this build can't read, or the store's.
+pub fn finish_confirmed(
+    keychain: &Keychain,
+    item: &Item,
+    made_by: &str,
+    confirm: &dyn Confirm,
+) -> Result<Finished, String> {
     let next = item.next();
+    let kept = |why: String| format!("hand-off-kept: {item} is written, and {next} is kept beside it: {why}");
     match (keychain.get(item), keychain.get(&next)) {
-        (Err(CustodyError::NotHeld(_)), Ok(_)) => keychain.rename(&next, item, made_by).map_err(|e| e.to_string()),
-        (Ok(_), Err(CustodyError::NotHeld(_))) => Ok(()),
-        // A rename cut short after its write: both hold the same value, so .next goes.
-        (Ok(a), Ok(b)) if a.expose(|x| b.expose(|y| x == y)) => keychain.remove(&next).map_err(|e| e.to_string()),
+        (Err(CustodyError::NotHeld(_)), Ok(_)) => match keychain.rename_confirmed(&next, item, made_by, confirm) {
+            Ok(Moved::Moved) => Ok(Finished::Done),
+            Ok(Moved::Kept(why)) => Ok(Finished::Kept(kept(why))),
+            Err(e) => Err(e.to_string()),
+        },
+        (Ok(_), Err(CustodyError::NotHeld(_))) => Ok(Finished::Done),
+        // A rename cut short after its write: both hold the same value, so .next goes once the other reader reads
+        // the item.
+        (Ok(a), Ok(b)) if a.expose(|x| b.expose(|y| x == y)) => match confirm.confirms(item, &a) {
+            Confirmed::Reads => keychain.remove(&next).map(|()| Finished::Done).map_err(|e| e.to_string()),
+            Confirmed::Cannot(why) | Confirmed::Unclear(why) => Ok(Finished::Kept(kept(why))),
+        },
         (Ok(_), Ok(_)) => Err(format!("{item} and {} hold different values; nothing is changed", next)),
         (Err(CustodyError::NotHeld(_)), Err(CustodyError::NotHeld(_))) => {
             Err(format!("neither {item} nor {next} is held"))
@@ -162,7 +214,11 @@ mod tests {
             if self.cut {
                 return Err("cut short".into());
             }
-            finish(self.keychain, &self.item, NEW)
+            // The placed build, run fresh, read it: the carry's finish.
+            match super::finish_confirmed(self.keychain, &self.item, NEW, &Says(crate::custody::Confirmed::Reads))? {
+                super::Finished::Done => Ok(()),
+                super::Finished::Kept(why) => Err(why),
+            }
         }
     }
 
@@ -223,14 +279,17 @@ mod tests {
     }
 
     /// finish() is safe at every state it can find: both held and equal (a rename cut after its write)
-    /// cleans up; both held and different changes nothing; neither held says so; add never overwrites.
+    /// keeps `.next` until another reader reads the item, then cleans up; both held and different changes nothing; neither held says so; add never overwrites.
     #[test]
     fn finish_settles_every_state_it_finds() {
         let (_dir, k) = keychain();
         let item = Item::new("ai.anemnez.example.role", "x");
         k.add(&item, &Secret::new(VALUE.into()), "old").unwrap();
         k.add(&item.next(), &Secret::new(VALUE.into()), NEW).unwrap();
-        finish(&k, &item, NEW).expect("equal: .next goes");
+        assert!(finish(&k, &item, NEW).unwrap_err().starts_with("hand-off-kept"), "no other reader: .next is kept");
+        assert!(held(&k, &item.next()).is_some());
+        let read = Says(crate::custody::Confirmed::Reads);
+        assert_eq!(super::finish_confirmed(&k, &item, NEW, &read), Ok(super::Finished::Done), "read fresh: .next goes");
         assert!(held(&k, &item.next()).is_none());
         k.add(&item.next(), &Secret::new(b"different".to_vec()), NEW).unwrap();
         assert!(finish(&k, &item, NEW).unwrap_err().contains("different values"));
@@ -241,6 +300,36 @@ mod tests {
         ));
         let none = Item::new("ai.anemnez.example.role", "absent");
         assert!(finish(&k, &none, NEW).unwrap_err().contains("neither"));
+    }
+
+    /// A stand-in for the placed build run fresh: it answers what it's told.
+    struct Says(crate::custody::Confirmed);
+    impl crate::custody::Confirm for Says {
+        fn confirms(&self, _: &Item, _: &Secret) -> crate::custody::Confirmed {
+            self.0.clone()
+        }
+    }
+
+    /// The carry's finish keeps `.next` until the placed build, run fresh, reads the item (D m/38565): moving and
+    /// cut short after the move alike, a refusal or no answer keeps both, by name, and its word moves it.
+    #[test]
+    fn a_finish_keeps_next_until_another_reader_reads_the_item() {
+        use super::{Finished, finish_confirmed};
+        use crate::custody::Confirmed;
+        let (_dir, k) = keychain();
+        let item = Item::new("ai.anemnez.example.role", "carried@node");
+        k.add(&item.next(), &Secret::new(VALUE.into()), NEW).unwrap();
+        let cannot = Says(Confirmed::Cannot("the placed build can't read it".into()));
+        let first = finish_confirmed(&k, &item, NEW, &cannot).expect("written");
+        assert!(matches!(&first, Finished::Kept(why) if why.starts_with("hand-off-kept")), "{first:?}");
+        assert!(held(&k, &item).is_some() && held(&k, &item.next()).is_some(), "both kept");
+        let unclear = Says(Confirmed::Unclear("no answer".into()));
+        let again = finish_confirmed(&k, &item, NEW, &unclear).expect("both held, the same");
+        assert!(matches!(again, Finished::Kept(_)), "cut short after the move: still kept");
+        assert!(held(&k, &item.next()).is_some());
+        assert_eq!(finish_confirmed(&k, &item, NEW, &Says(Confirmed::Reads)), Ok(Finished::Done));
+        assert!(held(&k, &item.next()).is_none(), "read fresh: .next goes");
+        assert_eq!(held(&k, &item).as_deref(), Some(VALUE.as_bytes()));
     }
 
     /// RFC 4231 test case 2: HMAC-SHA-256 is the standard one.

@@ -112,6 +112,10 @@ spoken_for("a-hand-off-never-leaves-a-key-unheld", {
 	"handoff::tests::a_hand_off_moves_the_value_and_finishes_after_a_cut",
 	"handoff::tests::a_successor_that_cannot_prove_the_value_leaves_the_original",
 	"handoff::tests::finish_settles_every_state_it_finds",
+	"handoff::tests::a_finish_keeps_next_until_another_reader_reads_the_item",
+	"custody::tests::a_rename_keeps_the_original_until_another_reader_reads_the_moved_item",
+	"signer::tests::a_carry_finishes_only_once_the_placed_build_reads_the_key_fresh",
+	"signer::tests::a_start_that_meets_a_pending_next_leaves_both",
 })
 spoken_for("a-key-goes-only-to-a-checked-successor", {
 	"retrust::tests::a_successor_is_allowed_by_identifier_then_team_then_the_owner",
