@@ -5,7 +5,7 @@ version = 4
 [[package]]
 name = "anemnez-clock"
 version = "0.1.0"
-source = "git+ssh://git@github.com/anemnez/anemnez-clock.git?rev=eabaaf22f8c4#eabaaf22f8c408b3732f4bbd6faab6300c419300"
+source = "git+ssh://git@github.com/anemnez/anemnez-clock.git?rev=92307ea4fe1e#92307ea4fe1ef24b7412033ec2532680fe0d37f7"
 dependencies = [
  "libc",
  "tokio",
@@ -37,7 +37,7 @@ dependencies = [
 [[package]]
 name = "anemnez-trust"
 version = "0.10.48"
-source = "git+ssh://git@github.com/anemnez/anemnez-extension.git?rev=269826e6a3b9#269826e6a3b9ebcd83c2d609ca076fca72af96f5"
+source = "git+ssh://git@github.com/anemnez/anemnez-extension.git?rev=cdd4e1e2c8a2#cdd4e1e2c8a28cc934affb8ea66785ffd64c7f3e"
 
 [[package]]
 name = "base64ct"
