@@ -9,6 +9,6 @@ owner = "N"
 
 [anemnez-extension-family]
 repo = "anemnez/anemnez-extension"
-rev = "8af1a4288f50"
+rev = "347ed399968c"
 why = "anemnez-trust, the house's trust table and team id's one home (rule 2), on the same clock as this crate"
 owner = "N"
