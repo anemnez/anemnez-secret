@@ -82,6 +82,63 @@ pub fn of_peer(_: std::os::fd::BorrowedFd<'_>) -> Result<Identity, String> {
     Err("this OS has no code signatures to read".to_owned())
 }
 
+/// Why a peer has no [`Identity`], typed so a reader decides on the variant, never on the words (rule 5; H m/50346).
+/// The words are [`of_peer`]'s, unchanged, and [`IdentityError::why`] or `Display` gives them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum IdentityError {
+    /// Nothing was judged: the peer couldn't be read (gone between connect and read, its audit token or running
+    /// code not found, an OS error). Unclear, never a refusal: ask again.
+    Unread(String),
+    /// Its signature was read and judged: not Apple-anchored and strictly valid, not hardened, tampering
+    /// entitlements, or naming no identifier or team. Not ours, for the life of that process.
+    Unmet(String),
+}
+
+impl IdentityError {
+    /// [`of_peer`]'s words, sorted by the one rule [`Verdicts`] already caches by: a refusal the signature itself
+    /// gives is [`IdentityError::Unmet`], anything else [`IdentityError::Unread`].
+    fn of(why: String) -> Self {
+        if lasting(&why) { Self::Unmet(why) } else { Self::Unread(why) }
+    }
+
+    /// The words, as [`of_peer`] says them.
+    #[must_use]
+    pub fn why(&self) -> &str {
+        match self {
+            Self::Unread(why) | Self::Unmet(why) => why,
+        }
+    }
+}
+
+impl std::fmt::Display for IdentityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.why())
+    }
+}
+
+impl std::error::Error for IdentityError {}
+
+/// [`of_peer`], typed: [`IdentityError::Unread`] when nothing was judged, [`IdentityError::Unmet`] when the
+/// signature was. The one check is [`of_peer`]'s; readers move here, and `of_peer`'s string form retires once they
+/// have. BLOCKS, possibly for seconds: never on an async worker (see the module docs).
+///
+/// # Errors
+/// Why the peer has no identity, by variant.
+#[cfg(target_os = "macos")]
+pub fn of_peer_judged(socket: std::os::fd::BorrowedFd<'_>) -> Result<Identity, IdentityError> {
+    of_peer(socket).map_err(IdentityError::of)
+}
+
+/// [`of_peer`], typed. With no code signatures on this OS, no peer can be ours: a judgment, so Unmet.
+///
+/// # Errors
+/// Always [`IdentityError::Unmet`].
+#[cfg(not(target_os = "macos"))]
+pub fn of_peer_judged(socket: std::os::fd::BorrowedFd<'_>) -> Result<Identity, IdentityError> {
+    of_peer(socket).map_err(IdentityError::Unmet)
+}
+
 /// This process's own identity, by the same strict check (`SecCodeCopySelf`): what a product's default
 /// trust is built on ("my own team"), so it never names a publisher and never reads one from config.
 /// BLOCKS, possibly for seconds: never on an async worker (see the module docs).
@@ -208,6 +265,18 @@ impl Verdicts {
 pub fn of_peer_cached(verdicts: &Verdicts, socket: std::os::fd::BorrowedFd<'_>) -> Result<Identity, String> {
     let token = audit_token(socket)?;
     verdicts.get_or_check(&token, || judge(macos::check(&macos::guest_by_audit(&token)?, APPLE_ANCHORED)?))
+}
+
+/// [`of_peer_cached`], typed as [`of_peer_judged`] is. BLOCKS on a miss, possibly for seconds.
+///
+/// # Errors
+/// Why the peer has no identity, by variant.
+#[cfg(target_os = "macos")]
+pub fn of_peer_cached_judged(
+    verdicts: &Verdicts,
+    socket: std::os::fd::BorrowedFd<'_>,
+) -> Result<Identity, IdentityError> {
+    of_peer_cached(verdicts, socket).map_err(IdentityError::of)
 }
 
 /// A local socket's peer's whole audit token (`audit_token_t`'s eight words: auid, euid, egid, ruid,
@@ -1202,5 +1271,51 @@ mod tests {
         let (ours, _theirs) = std::os::unix::net::UnixStream::pair().expect("a pair");
         let found = of_peer(ours.as_fd()).expect_err("an ad hoc test binary");
         assert!(found.contains("not Apple-anchored"), "the token was read and the code checked: {found}");
+    }
+
+    /// A peer whose signature was read and judged is Unmet, by the variant; one that couldn't be read (here no socket
+    /// at all, so no audit token) is Unread. Each keeps of_peer's words (H m/50346).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_judged_peer_is_unmet_and_an_unread_one_is_unread() {
+        use std::os::fd::AsFd;
+        let (ours, _theirs) = std::os::unix::net::UnixStream::pair().expect("a pair");
+        let judged = of_peer_judged(ours.as_fd()).expect_err("an ad hoc test binary");
+        assert!(matches!(judged, IdentityError::Unmet(_)), "{judged:?}");
+        assert_eq!(judged.why(), of_peer(ours.as_fd()).unwrap_err());
+        let file = std::fs::File::open("/dev/null").expect("/dev/null");
+        let unread = of_peer_judged(file.as_fd()).expect_err("not a socket");
+        assert!(matches!(unread, IdentityError::Unread(_)), "{unread:?}");
+        assert!(unread.to_string().contains("its audit token cannot be read"), "{unread}");
+        let verdicts = Verdicts::on(
+            anemnez_clock::ManualClock::new().clock(),
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(5),
+            8,
+        );
+        assert!(matches!(of_peer_cached_judged(&verdicts, ours.as_fd()), Err(IdentityError::Unmet(_))));
+        assert!(matches!(of_peer_cached_judged(&verdicts, file.as_fd()), Err(IdentityError::Unread(_))));
+    }
+
+    /// Every refusal the signature itself gives is Unmet, and what only says the peer couldn't be read is Unread:
+    /// the one line Verdicts caches by.
+    #[test]
+    fn each_refusal_is_sorted_by_whether_the_signature_gave_it() {
+        for unmet in [
+            "ai.anemnez.x does not run with the hardened runtime",
+            "ai.anemnez.x carries com.apple.security.get-task-allow",
+            "its code is not Apple-anchored and strictly valid (OSStatus -67050)",
+            "its signature names no identifier",
+            "its signature names no team",
+        ] {
+            assert!(matches!(IdentityError::of(unmet.to_owned()), IdentityError::Unmet(_)), "{unmet}");
+        }
+        for unread in [
+            "its audit token cannot be read: Socket operation on non-socket (os error 38)",
+            "its running code cannot be found (OSStatus -67068)",
+            "its signing information cannot be read (OSStatus -67061)",
+        ] {
+            assert!(matches!(IdentityError::of(unread.to_owned()), IdentityError::Unread(_)), "{unread}");
+        }
     }
 }
