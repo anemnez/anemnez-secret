@@ -188,6 +188,21 @@ fn lasting(refusal: &str) -> bool {
     LASTING.iter().any(|p| refusal.contains(p))
 }
 
+/// `errSecCSStaticCodeChanged`: the code on disk no longer matches what is running, a binary swapped under a running
+/// process (a moment of an upgrade), never the signature's verdict.
+const STATIC_CODE_CHANGED: i32 = -67034;
+
+/// Why a code that failed strict validity against its requirement has no identity, by its OSStatus. A swapped binary
+/// is said apart, in words [`LASTING`] doesn't hold, so it is Unread and never cached: caching it would refuse a peer
+/// that is about to be valid (D m/50377). Every other failure is the signature's verdict, Unmet.
+fn invalid(status: i32) -> String {
+    if status == STATIC_CODE_CHANGED {
+        format!("its code on disk changed under it, as in an upgrade, so it was not judged (OSStatus {status})")
+    } else {
+        format!("its code is not Apple-anchored and strictly valid (OSStatus {status})")
+    }
+}
+
 /// One cached verdict: when it was checked, and what the check said.
 type Held = std::collections::HashMap<Vec<u8>, (anemnez_clock::Mono, Result<Identity, String>)>;
 
@@ -829,7 +844,7 @@ mod macos {
     pub(super) fn check(code: &impl Signed, requirement: &str) -> Result<super::Signature, String> {
         let status = validity(code, Some(requirement))?;
         if status != 0 {
-            return Err(format!("its code is not Apple-anchored and strictly valid (OSStatus {status})"));
+            return Err(super::invalid(status));
         }
         let mut info: CFDictionaryRef = std::ptr::null();
         // SAFETY: a valid code ref (a SecCode is accepted where a SecStaticCode is); `info` is +1 on success.
@@ -1020,6 +1035,14 @@ mod tests {
         let _ = v.get_or_check(b"tok-c", transient);
         let _ = v.get_or_check(b"tok-c", transient);
         assert_eq!(runs.get(), 4, "a transient failure: never cached");
+        let swaps = Cell::new(0);
+        let swapped = || {
+            swaps.set(swaps.get() + 1);
+            Err(super::invalid(super::STATIC_CODE_CHANGED))
+        };
+        let _ = v.get_or_check(b"tok-s", swapped);
+        let _ = v.get_or_check(b"tok-s", swapped);
+        assert_eq!(swaps.get(), 2, "a binary swapped mid-upgrade: never cached (D m/50377)");
         assert!(v.lock().len() <= 2, "the cap holds: {}", v.lock().len());
         let stale = super::Verdicts::on(
             anemnez_clock::Clock::system(),
@@ -1304,7 +1327,8 @@ mod tests {
         for unmet in [
             "ai.anemnez.x does not run with the hardened runtime",
             "ai.anemnez.x carries com.apple.security.get-task-allow",
-            "its code is not Apple-anchored and strictly valid (OSStatus -67050)",
+            &super::invalid(-67050),
+            &super::invalid(-67062),
             "its signature names no identifier",
             "its signature names no team",
         ] {
@@ -1314,6 +1338,7 @@ mod tests {
             "its audit token cannot be read: Socket operation on non-socket (os error 38)",
             "its running code cannot be found (OSStatus -67068)",
             "its signing information cannot be read (OSStatus -67061)",
+            &super::invalid(super::STATIC_CODE_CHANGED),
         ] {
             assert!(matches!(IdentityError::of(unread.to_owned()), IdentityError::Unread(_)), "{unread}");
         }

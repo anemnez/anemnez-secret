@@ -192,7 +192,9 @@ moved from fabric's step 0 `writers.rs`).
   reader decides on the variant (rule 5; H m/50346): `IdentityError::Unread` when nothing was judged (the peer
   couldn't be read: gone, its token or code not found), unclear, so ask again; `IdentityError::Unmet` when its
   signature was read and judged, not ours. The line is the one `Verdicts` caches by: a refusal the signature
-  itself gives. Readers move to the typed form, then `of_peer`'s string form retires.
+  itself gives. A binary swapped on disk under its running process (`errSecCSStaticCodeChanged`, -67034) is a
+  moment of an upgrade, not the signature's verdict, so it is Unread and never cached; every other strict-validity
+  failure is Unmet (D m/50377). Readers move to the typed form, then `of_peer`'s string form retires.
 - `TrustTable` holds the rows: `Anemnez {team}`, under which `ai.anemnez.<p>` writes what product `<p>`
   owns (who owns what is the caller's to say), and `Scoped {team, identifier, segment}`, which a person
   adds for one other team's process and exactly one segment. `TrustTable::anemnez(team)` is the default
